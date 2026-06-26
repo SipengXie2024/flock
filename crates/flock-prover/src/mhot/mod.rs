@@ -1,3 +1,4 @@
+pub mod content;
 pub mod hash_only;
 pub mod multi_base;
 pub mod ref_witness;
