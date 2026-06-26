@@ -128,7 +128,11 @@ pub fn prove_multi(
 }
 
 pub fn verify_multi(proof: &MhotMultiProof) -> Result<(), VerifyError> {
-    let mut challenger = FsChallenger::new(TRANSCRIPT_LABEL);
+    verify_multi_with_label(proof, TRANSCRIPT_LABEL)
+}
+
+fn verify_multi_with_label(proof: &MhotMultiProof, label: &[u8]) -> Result<(), VerifyError> {
+    let mut challenger = FsChallenger::new(label);
 
     let hash_setup = KeccakSetup::new(hash_setup_n_keccaks(proof.n_keccaks));
     let (hash_ab, hash_c) = flock_core::verifier::verify_core(
@@ -293,11 +297,7 @@ mod tests {
     #[test]
     fn multi_prove_verify_roundtrip() {
         let start = Instant::now();
-        let sched = MhotHashSchedule::from_fanouts(&[4, 2]);
-        let hash_witness = build_ref_witness(&sched, 42);
-        let route_witnesses = route_witnesses_for_schedule(&sched);
-
-        let proof = prove_multi(&sched, &hash_witness, &route_witnesses);
+        let proof = make_valid_multi_proof();
         verify_multi(&proof).unwrap_or_else(|err| panic!("multi verifier rejected: {err:?}"));
         eprintln!(
             "multi_prove_verify_roundtrip elapsed: {:?}, n_keccaks={}, n_routes={}",
@@ -305,6 +305,45 @@ mod tests {
             proof.n_keccaks,
             proof.n_routes
         );
+    }
+
+    #[test]
+    fn multi_verify_rejects_wrong_label() {
+        let proof = make_valid_multi_proof();
+        let err = verify_multi_with_label(&proof, b"mhot-multi-WRONG")
+            .expect_err("wrong transcript label must be rejected");
+        eprintln!("multi_verify_rejects_wrong_label: {err:?}");
+    }
+
+    #[test]
+    fn multi_verify_rejects_tampered_commitment() {
+        let mut proof = make_valid_multi_proof();
+        proof.hash_commitment.root[0] ^= 1;
+        let err = verify_multi(&proof).expect_err("tampered hash commitment must be rejected");
+        eprintln!("multi_verify_rejects_tampered_commitment: {err:?}");
+    }
+
+    #[test]
+    fn multi_verify_rejects_swapped_base_order() {
+        let mut proof = make_valid_multi_proof();
+        std::mem::swap(&mut proof.hash_zc, &mut proof.route_zc);
+        std::mem::swap(&mut proof.hash_lc, &mut proof.route_lc);
+        std::mem::swap(&mut proof.hash_pcs, &mut proof.route_pcs);
+        std::mem::swap(&mut proof.hash_commitment, &mut proof.route_commitment);
+        std::mem::swap(&mut proof.hash_claim, &mut proof.route_claim);
+
+        match std::panic::catch_unwind(|| verify_multi(&proof)) {
+            Ok(Err(err)) => eprintln!("multi_verify_rejects_swapped_base_order: {err:?}"),
+            Ok(Ok(())) => panic!("swapped base order must be rejected"),
+            Err(_) => eprintln!("multi_verify_rejects_swapped_base_order: panic"),
+        }
+    }
+
+    fn make_valid_multi_proof() -> MhotMultiProof {
+        let sched = MhotHashSchedule::from_fanouts(&[4, 2]);
+        let hash_witness = build_ref_witness(&sched, 42);
+        let route_witnesses = route_witnesses_for_schedule(&sched);
+        prove_multi(&sched, &hash_witness, &route_witnesses)
     }
 
     fn route_witnesses_for_schedule(sched: &MhotHashSchedule) -> Vec<RouteWitness> {
