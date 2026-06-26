@@ -1,5 +1,14 @@
-use crate::r1cs_hashes::common::{build_block_r1cs_with_matrices, or_bit_at};
+use crate::prover::{prove_fast_core, quirky_x_outer_full, ProveCore};
+use crate::r1cs_hashes::common::{
+    build_block_r1cs_with_matrices, drive_witness_packed_and_lincheck, or_bit_at,
+};
+use flock_core::challenger::FsChallenger;
+use flock_core::field::F128;
+use flock_core::pcs::{self, Commitment, PcsParams};
+use flock_core::proof::R1csClaim;
 use flock_core::r1cs::{BlockR1cs, SparseBinaryMatrix};
+use flock_core::verifier::VerifyError;
+use flock_core::{lincheck, zerocheck};
 
 pub const K_LOG: usize = 15;
 pub const K: usize = 1 << K_LOG;
@@ -30,6 +39,9 @@ pub const SELECTED_OUT_FINAL_BASE: usize = FOUND_OUT_FINAL_POS + 1;
 pub const USEFUL_BITS: usize = SELECTED_OUT_FINAL_BASE + DIGEST_BITS;
 
 const ROUTE_MASK_POSITIONS: [usize; W_MAX] = [0, 1];
+const TRANSCRIPT_LABEL: &[u8] = b"mhot-route-v0";
+const MIN_LIGERITO_M: usize = 22;
+const MIN_LIGERITO_INSTANCES: usize = 1 << (MIN_LIGERITO_M - K_LOG);
 
 #[inline]
 pub const fn child_base(child: usize) -> usize {
@@ -206,6 +218,160 @@ pub fn build_block_r1cs(n_blocks_log: usize) -> BlockR1cs {
     )
 }
 
+#[derive(Clone, Debug)]
+pub struct RouteSetup {
+    pub n_instances: usize,
+    pub setup_n_instances: usize,
+    pub r1cs: BlockR1cs,
+    pub pcs_params: PcsParams,
+}
+
+impl RouteSetup {
+    pub fn new(n_instances: usize) -> Self {
+        assert!(n_instances >= 1, "n_instances must be >= 1");
+        let setup_n_instances = route_setup_n_instances(n_instances);
+        let n_blocks_log = setup_n_instances.trailing_zeros() as usize;
+        let r1cs = build_block_r1cs(n_blocks_log);
+        r1cs.csc_lincheck_circuit();
+        flock_core::scratch::prewarm_prover(r1cs.m);
+        let pcs_params = PcsParams {
+            m: r1cs.m,
+            log_inv_rate: 1,
+            log_batch_size: 6,
+            profile: pcs::ligerito::LigeritoProfile::Fast,
+        };
+        Self {
+            n_instances,
+            setup_n_instances,
+            r1cs,
+            pcs_params,
+        }
+    }
+
+    pub fn n_blocks_log(&self) -> usize {
+        self.r1cs.m - self.r1cs.k_log
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct RouteWitness {
+    pub key: [bool; KEY_BITS],
+    pub mask: [bool; KEY_BITS],
+    pub children: Vec<[bool; DIGEST_BITS]>,
+}
+
+impl RouteWitness {
+    pub fn new(
+        key: [bool; KEY_BITS],
+        mask: [bool; KEY_BITS],
+        children: Vec<[bool; DIGEST_BITS]>,
+    ) -> Self {
+        assert_eq!(children.len(), FANOUT, "F_route PoC fanout is fixed at 4");
+        Self {
+            key,
+            mask,
+            children,
+        }
+    }
+}
+
+pub struct RouteProof {
+    pub zc_proof: zerocheck::ZerocheckProof,
+    pub lc_proof: lincheck::LincheckProof,
+    pub pcs_open: pcs::BatchOpeningProofLigerito,
+    pub commitment: Commitment,
+    pub claim: R1csClaim,
+    pub n_instances: usize,
+    pub setup_n_instances: usize,
+}
+
+pub fn generate_witness_with_ab_packed_and_lincheck(
+    witnesses: &[RouteWitness],
+    n_blocks_log: usize,
+) -> (
+    Vec<flock_core::field::F128>,
+    Vec<flock_core::field::F128>,
+    Vec<flock_core::field::F128>,
+    Vec<u8>,
+) {
+    let padding = padding_route_witness();
+    drive_witness_packed_and_lincheck(
+        witnesses,
+        Some(&padding),
+        n_blocks_log,
+        K_LOG,
+        |witness, z_u64, a_u64, b_u64| {
+            fill_block_witness(
+                &witness.key,
+                &witness.mask,
+                &witness.children,
+                z_u64,
+                a_u64,
+                b_u64,
+            );
+        },
+    )
+}
+
+pub fn prove_route(setup: &RouteSetup, witnesses: &[RouteWitness]) -> RouteProof {
+    assert_eq!(
+        witnesses.len(),
+        setup.n_instances,
+        "witness count must match RouteSetup::n_instances"
+    );
+    let (z_packed, a_packed, b_packed, z_lincheck) =
+        generate_witness_with_ab_packed_and_lincheck(witnesses, setup.n_blocks_log());
+    prove_route_from_parts(setup, z_packed, a_packed, b_packed, z_lincheck)
+}
+
+pub fn verify_route(setup: &RouteSetup, proof: &RouteProof) -> Result<R1csClaim, VerifyError> {
+    assert_eq!(
+        proof.n_instances, setup.n_instances,
+        "logical route instance count mismatch"
+    );
+    assert_eq!(
+        proof.setup_n_instances, setup.setup_n_instances,
+        "setup route instance count mismatch"
+    );
+
+    let mut challenger = FsChallenger::new(TRANSCRIPT_LABEL);
+    let lc_circuit = setup.r1cs.csc_lincheck_circuit();
+    let (ab, c) = flock_core::verifier::verify_core(
+        &setup.r1cs,
+        &proof.zc_proof,
+        &proof.lc_proof,
+        &proof.commitment,
+        lc_circuit,
+        &mut challenger,
+    )?;
+
+    let z_skips = [ab.point.z_skip, c.point.z_skip];
+    let values = [ab.value, c.value];
+    let ab_x_outer = quirky_x_outer_full(&ab.point);
+    let c_x_outer = quirky_x_outer_full(&c.point);
+    let x_outers = [ab_x_outer.as_slice(), c_x_outer.as_slice()];
+    let log_n = setup.r1cs.m - pcs::LOG_PACKING;
+    let lig_config = pcs::ligerito::verifier_config_for(
+        log_n,
+        setup.pcs_params.log_batch_size,
+        setup.pcs_params.profile,
+    )
+    .expect("Ligerito default verifier config");
+    pcs::verify_opening_batch_ligerito_mixed(
+        &proof.commitment,
+        &values,
+        &z_skips,
+        &x_outers,
+        &[],
+        &proof.pcs_open,
+        &lig_config,
+        &mut challenger,
+    )
+    .map_err(VerifyError::PcsAb)?;
+
+    Ok(R1csClaim { ab, c })
+}
+
 pub fn fill_block_witness(
     key: &[bool; KEY_BITS],
     mask: &[bool; KEY_BITS],
@@ -303,6 +469,91 @@ pub fn fill_block_witness(
     }
 }
 
+fn prove_route_from_parts(
+    setup: &RouteSetup,
+    z_packed: Vec<F128>,
+    a_packed: Vec<F128>,
+    b_packed: Vec<F128>,
+    z_lincheck: Vec<u8>,
+) -> RouteProof {
+    let mut challenger = FsChallenger::new(TRANSCRIPT_LABEL);
+    let lc_circuit = setup.r1cs.csc_lincheck_circuit();
+    let core = prove_fast_core(
+        &setup.r1cs,
+        &setup.pcs_params,
+        z_packed,
+        a_packed,
+        b_packed,
+        z_lincheck,
+        lc_circuit,
+        &mut challenger,
+    );
+
+    let ProveCore {
+        zc_proof,
+        lc_proof,
+        ab,
+        c,
+        commitment,
+        prover_data,
+        z_packed,
+        s_hat_v_ab,
+        s_hat_v_c,
+    } = core;
+
+    let log_n = setup.r1cs.m - pcs::LOG_PACKING;
+    let lig_config = pcs::ligerito::prover_config_for(
+        log_n,
+        setup.pcs_params.log_batch_size,
+        setup.pcs_params.profile,
+    )
+    .expect("Ligerito default prover config");
+
+    let padding = zerocheck::PaddingSpec {
+        k_log: setup.r1cs.k_log,
+        useful_bits_per_block: setup.r1cs.useful_bits,
+    };
+    let ab_x_outer = quirky_x_outer_full(&ab.point);
+    let c_x_outer = quirky_x_outer_full(&c.point);
+    let pre_ab = s_hat_v_ab.as_deref();
+    let pre_c = Some(s_hat_v_c.as_slice());
+    let pcs_open = pcs::open_batch_mixed_ligerito_with_precomputed_s_hat_v(
+        z_packed,
+        &prover_data,
+        &commitment,
+        &[ab_x_outer.as_slice(), c_x_outer.as_slice()],
+        &[pre_ab, pre_c],
+        &[],
+        &padding,
+        &lig_config,
+        &mut challenger,
+    );
+
+    let claim = R1csClaim { ab, c };
+
+    RouteProof {
+        zc_proof,
+        lc_proof,
+        pcs_open,
+        commitment,
+        claim,
+        n_instances: setup.n_instances,
+        setup_n_instances: setup.setup_n_instances,
+    }
+}
+
+fn route_setup_n_instances(n_instances: usize) -> usize {
+    n_instances.max(MIN_LIGERITO_INSTANCES).next_power_of_two()
+}
+
+fn padding_route_witness() -> RouteWitness {
+    let key = [false; KEY_BITS];
+    let mut mask = [false; KEY_BITS];
+    mask[0] = true;
+    mask[1] = true;
+    RouteWitness::new(key, mask, vec![[false; DIGEST_BITS]; FANOUT])
+}
+
 fn eq_expr(child: usize, bit: usize) -> Vec<usize> {
     if child_index_bit(child, bit) {
         vec![extracted_pos(child, bit)]
@@ -375,6 +626,7 @@ fn set_zab(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn layout_constants_consistent() {
@@ -449,7 +701,67 @@ mod tests {
         assert!(!r1cs.satisfies(&z));
     }
 
+    #[test]
+    fn prove_verify_route_roundtrip_smoke() {
+        let (elapsed, _) = time_it(|| {
+            let setup = RouteSetup::new(1);
+            assert_eq!(setup.setup_n_instances, MIN_LIGERITO_INSTANCES);
+            assert_eq!(setup.r1cs.m, MIN_LIGERITO_M);
+            let witness = sample_route_witness();
+            let proof = prove_route(&setup, &[witness]);
+            let claim = verify_route(&setup, &proof)
+                .unwrap_or_else(|err| panic!("route verifier rejected: {err:?}"));
+            assert_eq!(claim, proof.claim);
+        });
+        eprintln!(
+            "prove_verify_route_roundtrip_smoke elapsed: {elapsed:?}, setup_n_instances={MIN_LIGERITO_INSTANCES}, m={MIN_LIGERITO_M}"
+        );
+    }
+
+    #[test]
+    fn wrong_key_prove_verify_rejected() {
+        let (elapsed, _) = time_it(|| {
+            let setup = RouteSetup::new(1);
+            let witness = sample_route_witness();
+            let (mut z_packed, a_packed, b_packed, mut z_lincheck) =
+                generate_witness_with_ab_packed_and_lincheck(&[witness], setup.n_blocks_log());
+
+            flip_packed_bit(&mut z_packed, KEY_BASE);
+            flip_lincheck_bit(&mut z_lincheck, 0, KEY_BASE);
+
+            let proof = prove_route_from_parts(&setup, z_packed, a_packed, b_packed, z_lincheck);
+            let result = verify_route(&setup, &proof);
+            assert!(
+                result.is_err(),
+                "verifier must reject a trace with a tampered key bit"
+            );
+        });
+        eprintln!("wrong_key_prove_verify_rejected elapsed: {elapsed:?}");
+    }
+
     fn one_block_witness_bool() -> Vec<bool> {
+        let witness = sample_route_witness();
+
+        let mut z_u64 = vec![0u64; U64_PER_BLOCK];
+        let mut a_u64 = vec![0u64; U64_PER_BLOCK];
+        let mut b_u64 = vec![0u64; U64_PER_BLOCK];
+        fill_block_witness(
+            &witness.key,
+            &witness.mask,
+            &witness.children,
+            &mut z_u64,
+            &mut a_u64,
+            &mut b_u64,
+        );
+
+        let mut z = vec![false; K * (1 << 3)];
+        for bit in 0..K {
+            z[bit] = ((z_u64[bit >> 6] >> (bit & 63)) & 1) != 0;
+        }
+        z
+    }
+
+    fn sample_route_witness() -> RouteWitness {
         let mut key = [false; KEY_BITS];
         let mut mask = [false; KEY_BITS];
         key[0] = false;
@@ -457,19 +769,26 @@ mod tests {
         mask[0] = true;
         mask[1] = true;
 
-        let children: [[bool; DIGEST_BITS]; FANOUT] =
-            std::array::from_fn(|child| std::array::from_fn(|bit| ((child * 17 + bit) & 1) != 0));
+        let children: Vec<[bool; DIGEST_BITS]> = (0..FANOUT)
+            .map(|child| std::array::from_fn(|bit| ((child * 17 + bit) & 1) != 0))
+            .collect();
+        RouteWitness::new(key, mask, children)
+    }
 
-        let mut z_u64 = vec![0u64; U64_PER_BLOCK];
-        let mut a_u64 = vec![0u64; U64_PER_BLOCK];
-        let mut b_u64 = vec![0u64; U64_PER_BLOCK];
-        fill_block_witness(&key, &mask, &children, &mut z_u64, &mut a_u64, &mut b_u64);
-
-        let mut z = vec![false; K * (1 << 3)];
-        for bit in 0..K {
-            z[bit] = ((z_u64[bit >> 6] >> (bit & 63)) & 1) != 0;
+    fn flip_packed_bit(z_packed: &mut [F128], global_bit: usize) {
+        let packed_idx = global_bit / 128;
+        let local = global_bit % 128;
+        if local < 64 {
+            z_packed[packed_idx].lo ^= 1u64 << local;
+        } else {
+            z_packed[packed_idx].hi ^= 1u64 << (local - 64);
         }
-        z
+    }
+
+    fn flip_lincheck_bit(z_lincheck: &mut [u8], block: usize, inner: usize) {
+        let byte_idx = block / 8;
+        let bit = block % 8;
+        z_lincheck[byte_idx * K + inner] ^= 1u8 << bit;
     }
 
     fn satisfies_with_const_pin(r1cs: &BlockR1cs, z: &[bool]) -> bool {
@@ -480,5 +799,11 @@ mod tests {
             Some(pin) => (0..r1cs.n_outer()).all(|block| z[block * r1cs.k() + pin]),
             None => true,
         }
+    }
+
+    fn time_it<T>(f: impl FnOnce() -> T) -> (Duration, T) {
+        let start = Instant::now();
+        let output = f();
+        (start.elapsed(), output)
     }
 }
