@@ -135,6 +135,8 @@ impl MhotHashSchedule {
             }
         }
 
+        remove_leaf_wires_shadowed_by_atom_outputs(&mut wires);
+
         if let Some(src) = public_root_source(&node_root_atoms, &node_first_leaf_indices) {
             wires.push(Wire {
                 src,
@@ -168,6 +170,33 @@ fn nearest_parent_input(
         .copied()
         .flatten()
         .next()
+}
+
+fn remove_leaf_wires_shadowed_by_atom_outputs(wires: &mut Vec<Wire>) {
+    let mut internal_inputs = Vec::new();
+    for wire in wires.iter() {
+        if matches!(wire.src, WireEndpoint::AtomOutput { .. }) {
+            if let WireEndpoint::AtomInput {
+                atom_id,
+                child_slot,
+            } = wire.dst
+            {
+                internal_inputs.push((atom_id, child_slot));
+            }
+        }
+    }
+
+    wires.retain(|wire| match wire {
+        Wire {
+            src: WireEndpoint::LeafDigest { .. },
+            dst:
+                WireEndpoint::AtomInput {
+                    atom_id,
+                    child_slot,
+                },
+        } => !internal_inputs.contains(&(*atom_id, *child_slot)),
+        _ => true,
+    });
 }
 
 fn public_root_source(
@@ -236,6 +265,40 @@ mod tests {
                 atom.atom_id,
                 atom.n_children
             );
+        }
+    }
+
+    #[test]
+    fn schedule_atom_input_has_single_source_kind() {
+        let sched = MhotHashSchedule::from_fanouts(&[8, 4, 2]);
+        for leaf_wire in &sched.wires {
+            let Wire {
+                src: WireEndpoint::LeafDigest { .. },
+                dst:
+                    WireEndpoint::AtomInput {
+                        atom_id,
+                        child_slot,
+                    },
+            } = leaf_wire
+            else {
+                continue;
+            };
+
+            for atom_wire in &sched.wires {
+                assert!(
+                    !matches!(
+                        atom_wire,
+                        Wire {
+                            src: WireEndpoint::AtomOutput { .. },
+                            dst: WireEndpoint::AtomInput {
+                                atom_id: other_atom_id,
+                                child_slot: other_child_slot,
+                            },
+                        } if other_atom_id == atom_id && other_child_slot == child_slot
+                    ),
+                    "atom input ({atom_id}, {child_slot}) cannot be both external leaf and internal root"
+                );
+            }
         }
     }
 }

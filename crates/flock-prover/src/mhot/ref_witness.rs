@@ -158,7 +158,7 @@ fn fill_node_atom_states(
     prev_digest.expect("node with atoms must produce a root digest")
 }
 
-fn leaf_digest(seed: u64, leaf_index: usize) -> Digest {
+pub(crate) fn leaf_digest(seed: u64, leaf_index: usize) -> Digest {
     let mut state = seed ^ (leaf_index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
     let mut digest = [0u8; DIGEST_BYTES];
     for chunk in digest.chunks_exact_mut(8) {
@@ -183,7 +183,7 @@ fn fold_state(inputs: &[Digest]) -> [u8; STATE_BYTES] {
     state
 }
 
-fn keccak_f_digest(state: &[u8; STATE_BYTES]) -> Digest {
+pub(crate) fn keccak_f_digest(state: &[u8; STATE_BYTES]) -> Digest {
     let state = keccak_f_state(state);
     let mut digest = [0u8; DIGEST_BYTES];
     digest.copy_from_slice(&state[..DIGEST_BYTES]);
@@ -224,7 +224,7 @@ fn write_child_digest(state: &mut [u8; STATE_BYTES], child_slot: usize, digest: 
     state[start..start + DIGEST_BYTES].copy_from_slice(digest);
 }
 
-fn bytes_to_logical_state(bytes: &[u8; STATE_BYTES]) -> State {
+pub(crate) fn bytes_to_logical_state(bytes: &[u8; STATE_BYTES]) -> State {
     let mut state = [false; STATE_BITS];
     for lane in 0..N_LANES {
         for z in 0..LANE_BITS {
@@ -235,7 +235,7 @@ fn bytes_to_logical_state(bytes: &[u8; STATE_BYTES]) -> State {
     state
 }
 
-fn logical_state_to_bytes(state: &State) -> [u8; STATE_BYTES] {
+pub(crate) fn logical_state_to_bytes(state: &State) -> [u8; STATE_BYTES] {
     let mut bytes = [0u8; STATE_BYTES];
     for lane in 0..N_LANES {
         for z in 0..LANE_BITS {
