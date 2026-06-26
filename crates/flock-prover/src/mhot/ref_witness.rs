@@ -158,7 +158,7 @@ fn fill_node_atom_states(
     prev_digest.expect("node with atoms must produce a root digest")
 }
 
-pub(crate) fn leaf_digest(seed: u64, leaf_index: usize) -> Digest {
+pub fn leaf_digest(seed: u64, leaf_index: usize) -> Digest {
     let mut state = seed ^ (leaf_index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
     let mut digest = [0u8; DIGEST_BYTES];
     for chunk in digest.chunks_exact_mut(8) {
