@@ -5,3 +5,4 @@ pub mod ref_witness;
 pub mod route;
 pub mod schedule;
 pub mod wide_glue;
+pub mod zk_stub;
