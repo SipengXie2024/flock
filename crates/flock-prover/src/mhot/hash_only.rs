@@ -1,17 +1,23 @@
 use super::ref_witness::{bytes_to_logical_state, Digest, RefWitness};
 use super::schedule::MhotHashSchedule;
+use crate::prover::{prove_fast_core, quirky_x_outer_full, ProveCore};
 use crate::r1cs_hashes::keccak::{State, STATE_BITS};
-use crate::r1cs_hashes::keccak3::KeccakSetup;
+use crate::r1cs_hashes::keccak3::{
+    generate_witness_with_ab_packed_and_lincheck, KeccakLincheckCircuit, KeccakSetup,
+};
 use flock_core::challenger::FsChallenger;
-use flock_core::pcs::Commitment;
+use flock_core::pcs::{self, Commitment};
 use flock_core::proof::R1csClaim;
+use flock_core::zerocheck;
 
 const TRANSCRIPT_LABEL: &[u8] = b"mhot-hash-only-v0";
 const MIN_LIGERITO_KECCAKS: usize = 49;
 
 /// Proof artifact from hash-only MHOT prove.
 pub struct MhotHashProof {
-    pub proof: flock_core::proof::R1csProofLigerito,
+    pub zc_proof: zerocheck::ZerocheckProof,
+    pub lc_proof: flock_core::lincheck::LincheckProof,
+    pub pcs_open: pcs::BatchOpeningProofLigerito,
     pub commitment: Commitment,
     pub claim: R1csClaim,
     pub expected_root: Digest,
@@ -44,11 +50,67 @@ pub fn prove_mhot_hash_only(sched: &MhotHashSchedule, witness: &RefWitness) -> M
     initial_states.resize(setup_n_keccaks, [false; STATE_BITS]);
 
     let setup = KeccakSetup::new(setup_n_keccaks);
+    let (z_packed, a_packed, b_packed, z_lincheck) =
+        generate_witness_with_ab_packed_and_lincheck(&initial_states, setup.n_blocks_log());
+
     let mut challenger = FsChallenger::new(TRANSCRIPT_LABEL);
-    let (proof, commitment, claim) = setup.prove_fast(&initial_states, &mut challenger);
+    let core = prove_fast_core(
+        &setup.r1cs,
+        &setup.pcs_params,
+        z_packed,
+        a_packed,
+        b_packed,
+        z_lincheck,
+        &KeccakLincheckCircuit,
+        &mut challenger,
+    );
+
+    let ProveCore {
+        zc_proof,
+        lc_proof,
+        ab,
+        c,
+        commitment,
+        prover_data,
+        z_packed,
+        s_hat_v_ab,
+        s_hat_v_c,
+    } = core;
+
+    let log_n = setup.r1cs.m - pcs::LOG_PACKING;
+    let lig_config = pcs::ligerito::prover_config_for(
+        log_n,
+        setup.pcs_params.log_batch_size,
+        setup.pcs_params.profile,
+    )
+    .expect("Ligerito default prover config");
+
+    let padding = zerocheck::PaddingSpec {
+        k_log: setup.r1cs.k_log,
+        useful_bits_per_block: setup.r1cs.useful_bits,
+    };
+    let ab_x_outer = quirky_x_outer_full(&ab.point);
+    let c_x_outer = quirky_x_outer_full(&c.point);
+    let pre_ab = s_hat_v_ab.as_deref();
+    let pre_c = Some(s_hat_v_c.as_slice());
+    let pcs_open = pcs::open_batch_mixed_ligerito_with_precomputed_s_hat_v(
+        z_packed,
+        &prover_data,
+        &commitment,
+        &[ab_x_outer.as_slice(), c_x_outer.as_slice()],
+        &[pre_ab, pre_c],
+        &[],
+        &padding,
+        &lig_config,
+        &mut challenger,
+    );
+
+    let claim = R1csClaim { ab, c };
 
     MhotHashProof {
-        proof,
+        zc_proof,
+        lc_proof,
+        pcs_open,
         commitment,
         claim,
         expected_root: witness.expected_root,
@@ -70,7 +132,40 @@ pub fn verify_mhot_hash_only(
     );
     let setup = KeccakSetup::new(setup_n_keccaks);
     let mut challenger = FsChallenger::new(TRANSCRIPT_LABEL);
-    setup.verify(&proof.commitment, &proof.proof, &mut challenger)
+    let (ab, c) = flock_core::verifier::verify_core(
+        &setup.r1cs,
+        &proof.zc_proof,
+        &proof.lc_proof,
+        &proof.commitment,
+        &KeccakLincheckCircuit,
+        &mut challenger,
+    )?;
+
+    let z_skips = [ab.point.z_skip, c.point.z_skip];
+    let values = [ab.value, c.value];
+    let ab_x_outer = quirky_x_outer_full(&ab.point);
+    let c_x_outer = quirky_x_outer_full(&c.point);
+    let x_outers = [ab_x_outer.as_slice(), c_x_outer.as_slice()];
+    let log_n = setup.r1cs.m - pcs::LOG_PACKING;
+    let lig_config = pcs::ligerito::verifier_config_for(
+        log_n,
+        setup.pcs_params.log_batch_size,
+        setup.pcs_params.profile,
+    )
+    .expect("Ligerito default verifier config");
+    pcs::verify_opening_batch_ligerito_mixed(
+        &proof.commitment,
+        &values,
+        &z_skips,
+        &x_outers,
+        &[],
+        &proof.pcs_open,
+        &lig_config,
+        &mut challenger,
+    )
+    .map_err(flock_core::verifier::VerifyError::PcsAb)?;
+
+    Ok(R1csClaim { ab, c })
 }
 
 fn ligerito_setup_n_keccaks(n_keccaks: usize) -> usize {
