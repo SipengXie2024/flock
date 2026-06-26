@@ -234,5 +234,9 @@ required-features = ["unsound-challenger"]
 name = "permutation"
 harness = false
 
+[[bench]]
+name = "mhot_bench"
+harness = false
+
 [lints]
 workspace = true
