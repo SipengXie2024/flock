@@ -1495,27 +1495,26 @@ pub fn round1_shift_reduce_extract_c_packed_padded(
 
     let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
 
-    // Parallel fold: each worker accumulates a subset of x_hi values into its
-    // own WorkerState. Reduce step combines the per-worker `local_res_*` by
-    // per-lane F128 XOR.
-    let (res_ab, res_c_s) = (0..hi_size)
+    let within_outer_bits = padding.k_log.saturating_sub(K_SKIP + N_INNER);
+    let class_bits_p = within_outer_bits.saturating_sub(eq.n_lo);
+    let n_classes_p = 1usize << class_bits_p;
+    let n_real_p = padding.n_real_blocks.unwrap_or(hi_size);
+    let is_pure_pad = |x_hi: usize| -> bool {
+        if padding.n_real_blocks.is_none() { return false; }
+        let min_blk = (x_hi << eq.n_lo) >> within_outer_bits;
+        let max_blk = ((x_hi << eq.n_lo) | (big_lo_size - 1)) >> within_outer_bits;
+        min_blk >= n_real_p && max_blk >= n_real_p
+    };
+
+    let real_xhis: Vec<usize> = (0..hi_size).filter(|&x| !is_pure_pad(x)).collect();
+    let (mut res_ab, mut res_c_s) = real_xhis
         .into_par_iter()
         .fold(WorkerState::new, |mut state, x_hi| {
             let eq_hi_val = eq_hi[x_hi];
             process_one_x_hi(
-                x_hi,
-                big_lo_size,
-                n_lo_and_inner,
-                within_outer_mask,
-                &b_med_counts,
-                a_packed,
-                b_packed,
-                c_packed,
-                inv_table,
-                &eq_lo_scaled,
-                eq_hi_val,
-                convert,
-                &mut state,
+                x_hi, big_lo_size, n_lo_and_inner, within_outer_mask,
+                &b_med_counts, a_packed, b_packed, c_packed, inv_table,
+                &eq_lo_scaled, eq_hi_val, convert, &mut state,
             );
             state
         })
@@ -1530,6 +1529,28 @@ pub fn round1_shift_reduce_extract_c_packed_padded(
                 (ab1, c1)
             },
         );
+
+    if padding.n_real_blocks.is_some() {
+        let cmask = n_classes_p - 1;
+        for cls in 0..n_classes_p {
+            let repr = (0..hi_size).find(|&x| is_pure_pad(x) && (x & cmask) == cls);
+            let repr = match repr { Some(r) => r, None => continue };
+            let mut tmpl = WorkerState::new();
+            process_one_x_hi(
+                repr, big_lo_size, n_lo_and_inner, within_outer_mask,
+                &b_med_counts, a_packed, b_packed, c_packed, inv_table,
+                &eq_lo_scaled, F128::ZERO, convert, &mut tmpl,
+            );
+            let mut esum = F128::ZERO;
+            for x in (0..hi_size).filter(|&x| is_pure_pad(x) && (x & cmask) == cls) {
+                esum += eq_hi[x];
+            }
+            for lane in 0..ELL {
+                res_ab[lane] += esum * tmpl.partial_ab[lane];
+                res_c_s[lane] += esum * tmpl.partial_c[lane];
+            }
+        }
+    }
 
     let res_c_lifted = ntt_extend_f128_vec_ghash(&res_c_s, inv_table);
     (res_ab.to_vec(), res_c_lifted)
@@ -1587,7 +1608,28 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
 
     let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
 
-    let (res_ab, res_c_s_0, res_c_s_1) = (0..hi_size)
+    // Padding-block skip: when n_real_blocks is set, padding blocks have
+    // identical deterministic witness. x_hi values that only touch padding
+    // blocks share the same partial (per block-inner class). We compute one
+    // template per class and scale by the summed eq_hi weight.
+    let within_outer_bits = padding.k_log.saturating_sub(K_SKIP + N_INNER);
+    let class_bits = within_outer_bits.saturating_sub(eq.n_lo);
+    let n_classes = 1usize << class_bits;
+    let n_real = padding.n_real_blocks.unwrap_or(hi_size);
+    // x_hi is pure-padding iff ALL x_outer_lo map to block >= n_real.
+    // block = (x_outer_lo | (x_hi << n_lo)) >> within_outer_bits.
+    // Worst case (max block): x_outer_lo = big_lo_size - 1.
+    // Pure-padding iff min_block >= n_real, where min_block = (x_hi << n_lo) >> within_outer_bits.
+    let is_pure_padding = |x_hi: usize| -> bool {
+        if padding.n_real_blocks.is_none() { return false; }
+        let min_block = (x_hi << eq.n_lo) >> within_outer_bits;
+        let max_block = ((x_hi << eq.n_lo) | (big_lo_size - 1)) >> within_outer_bits;
+        min_block >= n_real && max_block >= n_real
+    };
+
+    // Phase 1: process non-padding x_hi values
+    let real_x_his: Vec<usize> = (0..hi_size).filter(|&x| !is_pure_padding(x)).collect();
+    let (mut res_ab, mut res_c_s_0, mut res_c_s_1) = real_x_his
         .into_par_iter()
         .fold(WorkerStateWithSHatV::new, |mut state, x_hi| {
             let eq_hi_val = eq_hi[x_hi];
@@ -1620,6 +1662,36 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
                 (ab1, c0_1, c1_1)
             },
         );
+
+    // Phase 2: padding templates — one per block-inner class.
+    if padding.n_real_blocks.is_some() {
+        let class_mask = n_classes - 1;
+        for cls in 0..n_classes {
+            // Find the first pure-padding x_hi in this class.
+            let repr = (0..hi_size).find(|&x| is_pure_padding(x) && (x & class_mask) == cls);
+            let repr = match repr {
+                Some(r) => r,
+                None => continue,
+            };
+            // Compute template partial for this class.
+            let mut tmpl = WorkerStateWithSHatV::new();
+            process_one_x_hi_with_s_hat_v(
+                repr, big_lo_size, n_lo_and_inner, within_outer_mask,
+                &b_med_counts, a_packed, b_packed, c_packed, inv_table,
+                &eq_lo_scaled, F128::ZERO, convert, &mut tmpl,
+            );
+            // Sum eq_hi for all padding x_hi in this class.
+            let mut eq_sum = F128::ZERO;
+            for x_hi in (0..hi_size).filter(|&x| is_pure_padding(x) && (x & class_mask) == cls) {
+                eq_sum += eq_hi[x_hi];
+            }
+            for lane in 0..ELL {
+                res_ab[lane] += eq_sum * tmpl.partial_ab[lane];
+                res_c_s_0[lane] += eq_sum * tmpl.partial_c_0[lane];
+                res_c_s_1[lane] += eq_sum * tmpl.partial_c_1[lane];
+            }
+        }
+    }
 
     // Wire output: bank_0 + bank_1 reconstructs the original `res_c_s` (by
     // F_2-linearity of φ_8 over the masked-byte sum).
@@ -2013,6 +2085,7 @@ mod tests {
             let padding = PaddingSpec {
                 k_log,
                 useful_bits_per_block: useful_bits,
+            n_real_blocks: None,
             };
             let (padded_ab, padded_c) = round1_shift_reduce_extract_c_packed_padded(
                 &a_p, &b_p, &c_p, m, K_SKIP, &r, &table, &padding,

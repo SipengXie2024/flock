@@ -93,6 +93,7 @@ fn main() {
         "blake3" => PaddingSpec {
             k_log: 14,
             useful_bits_per_block: 15_409,
+            n_real_blocks: None,
         },
         other => panic!("padding arg must be 'dense' or 'blake3', got '{other}'"),
     };

@@ -3055,6 +3055,7 @@ mod tests {
             let padding = PaddingSpec {
                 k_log,
                 useful_bits_per_block: useful_bits,
+            n_real_blocks: None,
             };
 
             if packed.len().is_multiple_of(8) {
@@ -3116,6 +3117,7 @@ mod tests {
             let padding = PaddingSpec {
                 k_log,
                 useful_bits_per_block: useful_bits,
+            n_real_blocks: None,
             };
 
             let reference = fold_1b_rows_1way_mfr_16wide_padded(&w, &full_eq, &padding);
@@ -3153,6 +3155,7 @@ mod tests {
             let padding = PaddingSpec {
                 k_log,
                 useful_bits_per_block: useful_bits,
+            n_real_blocks: None,
             };
             let n_lo = split_n_lo(l);
             let r0: Vec<F128> = (0..l).map(|_| rng.f128()).collect();

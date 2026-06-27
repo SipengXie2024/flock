@@ -223,6 +223,7 @@ fn bench_one(n_keccaks: usize, n_runs: usize) {
     let padding = zerocheck::PaddingSpec {
         k_log: r1cs.k_log,
         useful_bits_per_block: r1cs.useful_bits,
+            n_real_blocks: None,
     };
     let t = Instant::now();
     let (_zc_proof, zc_claim) =

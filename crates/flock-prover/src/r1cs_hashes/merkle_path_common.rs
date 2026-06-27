@@ -381,6 +381,7 @@ pub fn prove_merkle_path_generic<Ch: Challenger>(
     let padding = flock_core::zerocheck::PaddingSpec {
         k_log: r1cs.k_log,
         useful_bits_per_block: r1cs.useful_bits,
+            n_real_blocks: None,
     };
     let ab_x_outer = crate::prover::quirky_x_outer_full(&core.ab.point);
     let c_x_outer = crate::prover::quirky_x_outer_full(&core.c.point);
@@ -619,6 +620,7 @@ pub fn prove_merkle_paths_generic<Ch: Challenger>(
     let padding = flock_core::zerocheck::PaddingSpec {
         k_log: r1cs.k_log,
         useful_bits_per_block: r1cs.useful_bits,
+            n_real_blocks: None,
     };
     let ab_x_outer = crate::prover::quirky_x_outer_full(&core.ab.point);
     let c_x_outer = crate::prover::quirky_x_outer_full(&core.c.point);

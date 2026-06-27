@@ -1,6 +1,6 @@
 use super::ref_witness::{bytes_to_logical_state, Digest, RefWitness};
 use super::schedule::MhotHashSchedule;
-use crate::prover::{prove_fast_core, quirky_x_outer_full, ProveCore};
+use crate::prover::{prove_fast_core_with_block_count, quirky_x_outer_full, ProveCore};
 use crate::r1cs_hashes::keccak::{State, STATE_BITS};
 use crate::r1cs_hashes::keccak3::{
     generate_witness_with_ab_packed_and_lincheck, KeccakLincheckCircuit, KeccakSetup,
@@ -53,8 +53,10 @@ pub fn prove_mhot_hash_only(sched: &MhotHashSchedule, witness: &RefWitness) -> M
     let (z_packed, a_packed, b_packed, z_lincheck) =
         generate_witness_with_ab_packed_and_lincheck(&initial_states, setup.n_blocks_log());
 
+    let n_real_blocks = (n_keccaks + 2) / 3;
+
     let mut challenger = FsChallenger::new(TRANSCRIPT_LABEL);
-    let core = prove_fast_core(
+    let core = prove_fast_core_with_block_count(
         &setup.r1cs,
         &setup.pcs_params,
         z_packed,
@@ -62,6 +64,7 @@ pub fn prove_mhot_hash_only(sched: &MhotHashSchedule, witness: &RefWitness) -> M
         b_packed,
         z_lincheck,
         &KeccakLincheckCircuit,
+        Some(n_real_blocks),
         &mut challenger,
     );
 
@@ -88,6 +91,7 @@ pub fn prove_mhot_hash_only(sched: &MhotHashSchedule, witness: &RefWitness) -> M
     let padding = zerocheck::PaddingSpec {
         k_log: setup.r1cs.k_log,
         useful_bits_per_block: setup.r1cs.useful_bits,
+            n_real_blocks: None,
     };
     let ab_x_outer = quirky_x_outer_full(&ab.point);
     let c_x_outer = quirky_x_outer_full(&c.point);

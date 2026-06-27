@@ -176,6 +176,7 @@ pub fn prove<Ch: Challenger>(
     let padding = zerocheck::PaddingSpec {
         k_log: r1cs.k_log,
         useful_bits_per_block: r1cs.useful_bits,
+            n_real_blocks: None,
     };
     let (zc_proof, zc_claim, s_hat_v_c) = zerocheck::prove_packed_padded_capture_s_hat_v_c(
         a_packed, b_packed, c_packed, r1cs.m, &padding, challenger,
@@ -309,6 +310,7 @@ pub fn prove_ligerito<Ch: Challenger>(
     let padding = zerocheck::PaddingSpec {
         k_log: r1cs.k_log,
         useful_bits_per_block: r1cs.useful_bits,
+            n_real_blocks: None,
     };
     let (zc_proof, zc_claim, s_hat_v_c) = zerocheck::prove_packed_padded_capture_s_hat_v_c(
         a_packed, b_packed, c_packed, r1cs.m, &padding, challenger,
@@ -413,6 +415,7 @@ pub fn prove_fast_from_witness<Ch: Challenger>(
     let padding = zerocheck::PaddingSpec {
         k_log: r1cs.k_log,
         useful_bits_per_block: r1cs.useful_bits,
+            n_real_blocks: None,
     };
     let pre_ab: Option<&[F128]> = core.s_hat_v_ab.as_deref();
     let pre_c: Option<&[F128]> = Some(core.s_hat_v_c.as_slice());
@@ -485,6 +488,7 @@ pub fn prove_fast_ligerito_from_witness<Ch: Challenger>(
     let padding = zerocheck::PaddingSpec {
         k_log: r1cs.k_log,
         useful_bits_per_block: r1cs.useful_bits,
+            n_real_blocks: None,
     };
     let pre_ab: Option<&[F128]> = s_hat_v_ab.as_deref();
     let pre_c: Option<&[F128]> = Some(s_hat_v_c.as_slice());
@@ -551,16 +555,28 @@ pub fn prove_fast_core<Ch: Challenger>(
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
     challenger: &mut Ch,
 ) -> ProveCore {
-    prove_fast_core_with_codeword(
-        r1cs,
-        pcs_params,
-        z_packed,
-        a_packed_f128,
-        b_packed_f128,
-        z_packed_lincheck,
-        lincheck_circuit,
-        None,
-        challenger,
+    prove_fast_core_with_block_count(r1cs, pcs_params, z_packed, a_packed_f128,
+        b_packed_f128, z_packed_lincheck, lincheck_circuit, None, challenger)
+}
+
+/// Like [`prove_fast_core`] but tells the zerocheck how many blocks are real
+/// (non-padding). Padding blocks with identical deterministic witness get
+/// their URM contribution computed once and scaled.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_fast_core_with_block_count<Ch: Challenger>(
+    r1cs: &BlockR1cs,
+    pcs_params: &PcsParams,
+    z_packed: Vec<F128>,
+    a_packed_f128: Vec<F128>,
+    b_packed_f128: Vec<F128>,
+    z_packed_lincheck: Vec<u8>,
+    lincheck_circuit: &dyn lincheck::LincheckCircuit,
+    n_real_blocks: Option<usize>,
+    challenger: &mut Ch,
+) -> ProveCore {
+    prove_fast_core_with_codeword_and_block_count(
+        r1cs, pcs_params, z_packed, a_packed_f128, b_packed_f128,
+        z_packed_lincheck, lincheck_circuit, None, n_real_blocks, challenger,
     )
 }
 
@@ -581,6 +597,25 @@ pub fn prove_fast_core_with_codeword<Ch: Challenger>(
     prefaulted_codeword: Option<Vec<F128>>,
     challenger: &mut Ch,
 ) -> ProveCore {
+    prove_fast_core_with_codeword_and_block_count(
+        r1cs, pcs_params, z_packed, a_packed_f128, b_packed_f128,
+        z_packed_lincheck, lincheck_circuit, prefaulted_codeword, None, challenger,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prove_fast_core_with_codeword_and_block_count<Ch: Challenger>(
+    r1cs: &BlockR1cs,
+    pcs_params: &PcsParams,
+    z_packed: Vec<F128>,
+    a_packed_f128: Vec<F128>,
+    b_packed_f128: Vec<F128>,
+    z_packed_lincheck: Vec<u8>,
+    lincheck_circuit: &dyn lincheck::LincheckCircuit,
+    prefaulted_codeword: Option<Vec<F128>>,
+    n_real_blocks: Option<usize>,
+    challenger: &mut Ch,
+) -> ProveCore {
     let (commitment, prover_data) = match prefaulted_codeword {
         Some(buf) => pcs::commit_into(&z_packed, pcs_params, buf),
         None => pcs::commit(&z_packed, pcs_params),
@@ -590,6 +625,7 @@ pub fn prove_fast_core_with_codeword<Ch: Challenger>(
     let padding = zerocheck::PaddingSpec {
         k_log: r1cs.k_log,
         useful_bits_per_block: r1cs.useful_bits,
+        n_real_blocks,
     };
     let (zc_proof, zc_claim, s_hat_v_c) = {
         // Zero-cost &[u8] views of the F128 buffers; c aliases z (C = I).
@@ -742,6 +778,7 @@ pub fn prove_fast_ligerito_timed<Ch: Challenger>(
     let padding = zerocheck::PaddingSpec {
         k_log: r1cs.k_log,
         useful_bits_per_block: r1cs.useful_bits,
+            n_real_blocks: None,
     };
 
     // --- zerocheck ---

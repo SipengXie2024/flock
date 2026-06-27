@@ -54,6 +54,7 @@ pub const K_SKIP: usize = 6;
 pub struct PaddingSpec {
     pub k_log: usize,
     pub useful_bits_per_block: usize,
+    pub n_real_blocks: Option<usize>,
 }
 
 impl PaddingSpec {
@@ -63,6 +64,7 @@ impl PaddingSpec {
         Self {
             k_log: m,
             useful_bits_per_block: 1usize << m,
+            n_real_blocks: None,
         }
     }
 }

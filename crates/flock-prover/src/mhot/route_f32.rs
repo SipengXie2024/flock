@@ -641,6 +641,7 @@ fn prove_route_from_parts(
     let padding = zerocheck::PaddingSpec {
         k_log: setup.r1cs.k_log,
         useful_bits_per_block: setup.r1cs.useful_bits,
+            n_real_blocks: None,
     };
     let ab_x_outer = quirky_x_outer_full(&ab.point);
     let c_x_outer = quirky_x_outer_full(&c.point);

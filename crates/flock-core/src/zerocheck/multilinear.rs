@@ -1443,6 +1443,7 @@ mod tests {
             let padding = PaddingSpec {
                 k_log,
                 useful_bits_per_block: useful_bits,
+            n_real_blocks: None,
             };
 
             let dense = uni_skip_fold_and_round_pair_optimized_packed(
