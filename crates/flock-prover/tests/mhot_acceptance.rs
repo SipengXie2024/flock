@@ -8,6 +8,7 @@ mod mhot_acceptance {
         multi_base::{prove_multi, verify_multi},
         ref_witness::{build_ref_witness, cpu_fold_root, leaf_digest, Digest},
         route::{self, prove_route, verify_route, RouteSetup, RouteWitness},
+        route_f32::{self as route32, RouteF32Setup, RouteF32Witness},
         schedule::MhotHashSchedule,
         wide_glue::{check_wiring_cpu, compute_atom_outputs},
     };
@@ -108,7 +109,20 @@ mod mhot_acceptance {
     fn multi_base_membership_roundtrip() {
         let sched = MhotHashSchedule::from_fanouts(&[4, 2]);
         let witness = build_ref_witness(&sched, 7);
-        let route_witnesses = route_witnesses_for_schedule(&sched);
+        let route_witnesses: Vec<RouteF32Witness> = sched.fanouts.iter().enumerate()
+            .map(|(node, _)| {
+                let mut key = [false; route32::KEY_BITS];
+                let mut mask = [false; route32::KEY_BITS];
+                key[0] = (node & 1) != 0;
+                key[1] = true;
+                mask[0] = true;
+                mask[1] = true;
+                let children: Vec<[bool; route32::DIGEST_BITS]> = (0..4)
+                    .map(|c| std::array::from_fn(|b| ((node * 31 + c * 17 + b) & 1) != 0))
+                    .collect();
+                RouteF32Witness::new_padded(key, mask, &children, 4)
+            })
+            .collect();
 
         let proof = prove_multi(&sched, &witness, &route_witnesses);
 

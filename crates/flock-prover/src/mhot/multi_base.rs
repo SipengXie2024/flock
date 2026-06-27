@@ -1,5 +1,5 @@
 use super::ref_witness::{bytes_to_logical_state, Digest, RefWitness};
-use super::route::{self, RouteSetup, RouteWitness};
+use super::route_f32::{self as route, RouteF32Setup as RouteSetup, RouteF32Witness as RouteWitness};
 use super::schedule::MhotHashSchedule;
 use crate::prover::{prove_fast_core, quirky_x_outer_full, ProveCore};
 use crate::r1cs_hashes::keccak::{State, STATE_BITS};
