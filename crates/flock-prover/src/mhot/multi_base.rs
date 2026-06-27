@@ -1,7 +1,7 @@
 use super::ref_witness::{bytes_to_logical_state, Digest, RefWitness};
 use super::route_f32::{self as route, RouteF32Setup as RouteSetup, RouteF32Witness as RouteWitness};
 use super::schedule::MhotHashSchedule;
-use crate::prover::{prove_fast_core, quirky_x_outer_full, ProveCore};
+use crate::prover::{prove_fast_core, prove_fast_core_with_block_count, quirky_x_outer_full, ProveCore};
 use crate::r1cs_hashes::keccak::{State, STATE_BITS};
 use crate::r1cs_hashes::keccak3::{
     generate_witness_with_ab_packed_and_lincheck, KeccakLincheckCircuit, KeccakSetup,
@@ -65,7 +65,8 @@ pub fn prove_multi(
     let hash_setup = KeccakSetup::new(setup_n_keccaks);
     let (hash_z, hash_a, hash_b, hash_zlc) =
         generate_witness_with_ab_packed_and_lincheck(&initial_states, hash_setup.n_blocks_log());
-    let hash_core = prove_fast_core(
+    let n_real_blocks = (n_keccaks + 2) / 3;
+    let hash_core = prove_fast_core_with_block_count(
         &hash_setup.r1cs,
         &hash_setup.pcs_params,
         hash_z,
@@ -73,6 +74,7 @@ pub fn prove_multi(
         hash_b,
         hash_zlc,
         &KeccakLincheckCircuit,
+        Some(n_real_blocks),
         &mut challenger,
     );
 

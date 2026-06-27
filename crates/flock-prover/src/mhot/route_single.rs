@@ -432,6 +432,7 @@ pub fn generate_witness_with_ab_packed_and_lincheck(
     )
 }
 
+#[deprecated(note = "UNSOUND without external wiring: child_index forgeable, no uniqueness, found/selected chain unbound. Use route_f32 instead.")]
 pub fn prove_route_single(
     setup: &RouteSingleSetup,
     witnesses: &[RouteSingleWitness],
@@ -446,6 +447,7 @@ pub fn prove_route_single(
     prove_from_parts(setup, z_packed, a_packed, b_packed, z_lincheck)
 }
 
+#[deprecated(note = "UNSOUND without external wiring: child_index forgeable, no uniqueness, found/selected chain unbound. Use route_f32 instead.")]
 pub fn verify_route_single(
     setup: &RouteSingleSetup,
     proof: &RouteSingleProof,

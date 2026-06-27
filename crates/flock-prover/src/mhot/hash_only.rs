@@ -91,7 +91,7 @@ pub fn prove_mhot_hash_only(sched: &MhotHashSchedule, witness: &RefWitness) -> M
     let padding = zerocheck::PaddingSpec {
         k_log: setup.r1cs.k_log,
         useful_bits_per_block: setup.r1cs.useful_bits,
-            n_real_blocks: None,
+        n_real_blocks: Some(n_real_blocks),
     };
     let ab_x_outer = quirky_x_outer_full(&ab.point);
     let c_x_outer = quirky_x_outer_full(&c.point);
