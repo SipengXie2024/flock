@@ -224,7 +224,7 @@ fn write_child_digest(state: &mut [u8; STATE_BYTES], child_slot: usize, digest: 
     state[start..start + DIGEST_BYTES].copy_from_slice(digest);
 }
 
-pub(crate) fn bytes_to_logical_state(bytes: &[u8; STATE_BYTES]) -> State {
+pub fn bytes_to_logical_state(bytes: &[u8; STATE_BYTES]) -> State {
     let mut state = [false; STATE_BITS];
     for lane in 0..N_LANES {
         for z in 0..LANE_BITS {
