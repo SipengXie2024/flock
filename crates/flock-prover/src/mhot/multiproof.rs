@@ -51,9 +51,10 @@ pub fn prove_mhot_multiproof(paths: &[MhotPathInput]) -> MhotMultiproof {
         );
     }
 
-    let mut all_initial_states: Vec<State> = Vec::new();
-    let mut all_route_witnesses: Vec<RouteF32Witness> = Vec::new();
-    let mut total_keccaks = 0usize;
+    let total_keccaks: usize = paths.iter().map(|p| p.schedule.hash_atoms.len()).sum();
+    let total_routes: usize = paths.iter().map(|p| p.route_witnesses.len()).sum();
+    let mut all_initial_states = Vec::with_capacity(total_keccaks);
+    let mut all_route_witnesses = Vec::with_capacity(total_routes);
 
     for path in paths {
         assert_eq!(
@@ -65,7 +66,6 @@ pub fn prove_mhot_multiproof(paths: &[MhotPathInput]) -> MhotMultiproof {
                 &path.hash_witness.atom_states[atom.atom_id],
             ));
         }
-        total_keccaks += path.schedule.hash_atoms.len();
         all_route_witnesses.extend(path.route_witnesses.iter().cloned());
     }
 
@@ -123,7 +123,7 @@ pub fn prove_mhot_multiproof(paths: &[MhotPathInput]) -> MhotMultiproof {
         &route_setup.r1cs,
         &route_setup.pcs_params,
         route_core,
-        0,
+        total_routes,
         &mut route_pcs_challenger,
     );
 
