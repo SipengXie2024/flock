@@ -1,7 +1,10 @@
 pub mod content;
 pub mod hash_only;
+pub mod merkle_membership;
+pub mod mhot_to_sha256;
 pub mod multi_base;
 pub mod multiproof;
+pub mod native_witness;
 pub mod ref_witness;
 pub mod route;
 pub mod route_f32;
