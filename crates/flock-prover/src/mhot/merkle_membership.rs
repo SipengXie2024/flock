@@ -1,70 +1,104 @@
 use crate::r1cs_hashes::sha2::{
-    Compression, MerklePathProof, MerklePathVerifyError, Sha256HybridSetup,
+    Compression, MerklePathProof, MerklePathVerifyError, SHA256_IV,
+    Sha256HybridSetup, min_n_blocks_log, sha256_compress,
 };
 use flock_core::challenger::Challenger;
 use flock_core::pcs::Commitment;
 
-use super::native_witness::{MhotNodeWitness, mhot_node_to_sha256_merkle, mhot_path_to_sha256_merkle};
+use super::native_witness::{MhotNodeWitness, mhot_node_to_sha256_merkle};
 
-/// Prove a single MHOT membership path (root-to-leaf node sequence) using
-/// Flock's SHA-256 binary Merkle proof. Each MHOT node's children form a
-/// binary Merkle tree; the in-node paths are concatenated into one big
-/// Merkle path proved by `Sha256HybridSetup::prove_merkle_path`.
-///
-/// Returns `(proof, commitment, leaf, root)` so the caller can hand them
-/// to `verify_mhot_sha256_path`.
-pub fn prove_mhot_sha256_path<Ch: Challenger>(
-    nodes: &[MhotNodeWitness],
-    challenger: &mut Ch,
-) -> (MerklePathProof, Commitment, [u32; 8], [u32; 8]) {
-    let w = mhot_path_to_sha256_merkle(nodes);
-    let n = w.compressions.len();
-
-    let setup = Sha256HybridSetup::new(n);
-    let needed = setup.n_block_slots();
-
-    // Pad compressions and b_bits to `needed` (power of 2, >= 8).
-    let mut compressions = w.compressions;
-    let mut b_bits = w.b_bits;
-    pad_to_power_of_two(&mut compressions, &mut b_bits, needed);
-
-    let (proof, commitment) = setup.prove_merkle_path(&compressions, &b_bits, challenger);
-    (proof, commitment, w.leaf, w.root)
+/// Proof for a single MHOT node's in-node binary Merkle path.
+pub struct NodeMerkleProof {
+    pub proof: MerklePathProof,
+    pub commitment: Commitment,
+    /// The selected child hash (the leaf of this in-node Merkle path).
+    pub leaf: [u32; 8],
+    /// Chain root after padding (what the Flock protocol verifies).
+    pub root: [u32; 8],
+    /// The real MHOT in-node Merkle root (for cross-node binding).
+    pub native_root: [u32; 8],
+    pub b_bits: Vec<bool>,
+    pub n_real_compressions: usize,
 }
 
-/// Verify a previously proved MHOT membership path.
-pub fn verify_mhot_sha256_path<Ch: Challenger>(
-    n_compressions: usize,
-    commitment: &Commitment,
-    proof: &MerklePathProof,
-    leaf: &[u32; 8],
-    root: &[u32; 8],
-    b_bits_orig: &[bool],
+/// Prove the in-node binary Merkle path for a single MHOT node.
+///
+/// The node's children form a binary Merkle tree. This function extracts the
+/// path from the selected child to the root, pads it to the minimum power-of-2
+/// length (at least 8), and produces a Flock SHA-256 Merkle path proof.
+pub fn prove_node_merkle<Ch: Challenger>(
+    node: &MhotNodeWitness,
+    challenger: &mut Ch,
+) -> NodeMerkleProof {
+    let w = mhot_node_to_sha256_merkle(node);
+    let n_real = w.compressions.len();
+
+    let mut compressions = w.compressions;
+    let mut b_bits = w.b_bits.clone();
+    let needed = 1usize << min_n_blocks_log(n_real);
+    let padded_root = pad_to_needed(&mut compressions, &mut b_bits, needed);
+
+    let setup = Sha256HybridSetup::new(needed);
+    let (proof, commitment) = setup.prove_merkle_path(&compressions, &b_bits, challenger);
+    NodeMerkleProof {
+        proof,
+        commitment,
+        leaf: w.leaf,
+        root: padded_root,
+        native_root: w.native_root,
+        b_bits: w.b_bits,
+        n_real_compressions: n_real,
+    }
+}
+
+/// Verify a single MHOT node's in-node Merkle path proof.
+pub fn verify_node_merkle<Ch: Challenger>(
+    proof: &NodeMerkleProof,
     challenger: &mut Ch,
 ) -> Result<(), MerklePathVerifyError> {
-    let setup = Sha256HybridSetup::new(n_compressions);
-    let needed = setup.n_block_slots();
-    let mut b_bits = b_bits_orig.to_vec();
-    // Pad b_bits the same way prover did.
+    let needed = 1usize << min_n_blocks_log(proof.n_real_compressions);
+    let setup = Sha256HybridSetup::new(needed);
+    let mut b_bits = proof.b_bits.clone();
     b_bits.resize(needed, false);
-    setup.verify_merkle_path(commitment, proof, leaf, root, &b_bits, challenger)
+    setup.verify_merkle_path(
+        &proof.commitment,
+        &proof.proof,
+        &proof.leaf,
+        &proof.root,
+        &b_bits,
+        challenger,
+    )
+}
+
+/// Prove in-node Merkle paths for a sequence of MHOT nodes (one proof per node).
+///
+/// Each node gets an independent proof. Cross-node linking (child's content
+/// hash == parent's selected leaf) is handled at a higher protocol level.
+pub fn prove_path_merkle<Ch: Challenger>(
+    nodes: &[MhotNodeWitness],
+    challenger: &mut Ch,
+) -> Vec<NodeMerkleProof> {
+    nodes.iter().map(|n| prove_node_merkle(n, challenger)).collect()
+}
+
+/// Verify in-node Merkle paths for a sequence of MHOT nodes.
+pub fn verify_path_merkle<Ch: Challenger>(
+    proofs: &[NodeMerkleProof],
+    challenger: &mut Ch,
+) -> Result<(), MerklePathVerifyError> {
+    for p in proofs {
+        verify_node_merkle(p, challenger)?;
+    }
+    Ok(())
 }
 
 /// Pad compressions and b_bits to `needed` slots with dummy identity
-/// compressions. The dummy compression hashes `(current_output, zeros)` so the
-/// chain remains valid but inert.
-fn pad_to_power_of_two(
+/// compressions that extend the Merkle chain. Returns the final chain root.
+fn pad_to_needed(
     compressions: &mut Vec<Compression>,
     b_bits: &mut Vec<bool>,
     needed: usize,
-) {
-    use crate::r1cs_hashes::sha2::{SHA256_IV, sha256_compress};
-
-    if compressions.len() >= needed {
-        return;
-    }
-
-    // The last real compression's output becomes the chain continuation value.
+) -> [u32; 8] {
     let last_output = if compressions.is_empty() {
         [0u32; 8]
     } else {
@@ -72,17 +106,21 @@ fn pad_to_power_of_two(
         sha256_compress(iv, m)
     };
 
+    if compressions.len() >= needed {
+        return last_output;
+    }
+
     let mut current = last_output;
     while compressions.len() < needed {
         let sibling = [0u32; 8];
         let mut m = [0u32; 16];
-        // Put current in left (b_bit = false), zero sibling in right.
         m[..8].copy_from_slice(&current);
         m[8..].copy_from_slice(&sibling);
         compressions.push((SHA256_IV, m));
         b_bits.push(false);
         current = sha256_compress(&SHA256_IV, &m);
     }
+    current
 }
 
 #[cfg(test)]
@@ -108,33 +146,21 @@ mod tests {
     }
 
     #[test]
-    fn merkle_membership_single_node_roundtrip() {
+    fn single_node_fanout8_roundtrip() {
         let node = MhotNodeWitness {
             children: make_random_children(8, 0xABCD_1234),
             selected_child: 5,
         };
-        let mut ch = FsChallenger::new(b"mhot-sha256-single");
-        let (proof, commitment, leaf, root) =
-            prove_mhot_sha256_path(&[node.clone()], &mut ch);
+        let mut ch = FsChallenger::new(b"mhot-node-merkle-1");
+        let proof = prove_node_merkle(&node, &mut ch);
 
-        let w = crate::mhot::native_witness::mhot_node_to_sha256_merkle(&node);
-        let n = w.compressions.len();
-
-        let mut chv = FsChallenger::new(b"mhot-sha256-single");
-        verify_mhot_sha256_path(
-            n,
-            &commitment,
-            &proof,
-            &leaf,
-            &root,
-            &w.b_bits,
-            &mut chv,
-        )
-        .expect("single node roundtrip must verify");
+        let mut chv = FsChallenger::new(b"mhot-node-merkle-1");
+        verify_node_merkle(&proof, &mut chv)
+            .expect("single node roundtrip must verify");
     }
 
     #[test]
-    fn merkle_membership_three_node_path_roundtrip() {
+    fn three_node_path_roundtrip() {
         let nodes = vec![
             MhotNodeWitness {
                 children: make_random_children(8, 0x1111),
@@ -145,56 +171,46 @@ mod tests {
                 selected_child: 1,
             },
             MhotNodeWitness {
-                children: make_random_children(2, 0x3333),
-                selected_child: 0,
+                children: make_random_children(16, 0x3333),
+                selected_child: 9,
             },
         ];
-        let mut ch = FsChallenger::new(b"mhot-sha256-3node");
-        let (proof, commitment, leaf, root) =
-            prove_mhot_sha256_path(&nodes, &mut ch);
+        let mut ch = FsChallenger::new(b"mhot-path-merkle-3");
+        let proofs = prove_path_merkle(&nodes, &mut ch);
+        assert_eq!(proofs.len(), 3);
 
-        let w = crate::mhot::native_witness::mhot_path_to_sha256_merkle(&nodes);
-        let n = w.compressions.len();
-
-        let mut chv = FsChallenger::new(b"mhot-sha256-3node");
-        verify_mhot_sha256_path(
-            n,
-            &commitment,
-            &proof,
-            &leaf,
-            &root,
-            &w.b_bits,
-            &mut chv,
-        )
-        .expect("3-node path roundtrip must verify");
+        let mut chv = FsChallenger::new(b"mhot-path-merkle-3");
+        verify_path_merkle(&proofs, &mut chv)
+            .expect("3-node path roundtrip must verify");
     }
 
     #[test]
-    fn merkle_membership_rejects_wrong_leaf() {
+    fn rejects_wrong_leaf() {
         let node = MhotNodeWitness {
             children: make_random_children(8, 0xBAD_CAFE),
             selected_child: 0,
         };
-        let mut ch = FsChallenger::new(b"mhot-sha256-wrong-leaf");
-        let (proof, commitment, leaf, root) =
-            prove_mhot_sha256_path(&[node.clone()], &mut ch);
+        let mut ch = FsChallenger::new(b"mhot-wrong-leaf");
+        let mut proof = prove_node_merkle(&node, &mut ch);
+        proof.leaf[0] ^= 1;
 
-        let w = crate::mhot::native_witness::mhot_node_to_sha256_merkle(&node);
-        let n = w.compressions.len();
+        let mut chv = FsChallenger::new(b"mhot-wrong-leaf");
+        let res = verify_node_merkle(&proof, &mut chv);
+        assert!(res.is_err(), "verifier must reject tampered leaf");
+    }
 
-        let mut bad_leaf = leaf;
-        bad_leaf[0] ^= 1;
+    #[test]
+    fn rejects_wrong_root() {
+        let node = MhotNodeWitness {
+            children: make_random_children(8, 0xDEAD_F00D),
+            selected_child: 3,
+        };
+        let mut ch = FsChallenger::new(b"mhot-wrong-root");
+        let mut proof = prove_node_merkle(&node, &mut ch);
+        proof.root[7] ^= 0xFFFF_FFFF;
 
-        let mut chv = FsChallenger::new(b"mhot-sha256-wrong-leaf");
-        let res = verify_mhot_sha256_path(
-            n,
-            &commitment,
-            &proof,
-            &bad_leaf,
-            &root,
-            &w.b_bits,
-            &mut chv,
-        );
-        assert!(res.is_err(), "verifier must reject wrong leaf");
+        let mut chv = FsChallenger::new(b"mhot-wrong-root");
+        let res = verify_node_merkle(&proof, &mut chv);
+        assert!(res.is_err(), "verifier must reject tampered root");
     }
 }

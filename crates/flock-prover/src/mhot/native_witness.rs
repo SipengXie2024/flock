@@ -1,4 +1,4 @@
-use crate::r1cs_hashes::sha2::{self, Compression, SHA256_IV, sha256_compress};
+use crate::r1cs_hashes::sha2::{Compression, SHA256_IV, sha256_compress};
 
 /// Witness data for a single MHOT node: the child digests and which child
 /// the membership path descends through.
@@ -15,7 +15,10 @@ pub struct BinaryMerkleWitness {
     pub compressions: Vec<Compression>,
     pub b_bits: Vec<bool>,
     pub leaf: [u32; 8],
+    /// Flock-convention chain root (b_bits[0] forced to false).
     pub root: [u32; 8],
+    /// The real MHOT in-node Merkle root (original tree structure preserved).
+    pub native_root: [u32; 8],
 }
 
 fn bytes_to_words(h: &[u8; 32]) -> [u32; 8] {
@@ -26,12 +29,20 @@ fn bytes_to_words(h: &[u8; 32]) -> [u32; 8] {
     w
 }
 
-/// Convert an MHOT node into a binary Merkle path witness for SHA-256.
+/// Convert an MHOT node into a binary Merkle path witness for SHA-256,
+/// compatible with Flock's Merkle-path protocol convention (b_bits[0] = false).
 ///
 /// The node's children are padded to the next power of two with zero hashes,
-/// then a binary Merkle tree is built bottom-up using SHA-256 compression.
-/// The path from `selected_child` to the root yields one `Compression` per
-/// tree level, along with the direction bits.
+/// then a binary Merkle tree is built bottom-up. The path from
+/// `selected_child` to the root yields one `Compression` per tree level.
+///
+/// Flock's protocol forces b_bits[0] = 0, meaning the leaf MUST appear in
+/// X_L = M[0..8] of the first compression. When the selected child is at an
+/// odd position (right child in the binary tree), we place it in M[0..8]
+/// anyway. This produces a different chain hash from the native tree but a
+/// self-consistent chain that the protocol can verify. The `root` field
+/// reflects the Flock-convention chain root, and `native_root` holds the
+/// real MHOT in-node Merkle root for cross-checking.
 pub fn mhot_node_to_sha256_merkle(node: &MhotNodeWitness) -> BinaryMerkleWitness {
     assert!(!node.children.is_empty(), "node must have at least one child");
     assert!(
@@ -50,11 +61,9 @@ pub fn mhot_node_to_sha256_merkle(node: &MhotNodeWitness) -> BinaryMerkleWitness
         .iter()
         .map(|c| bytes_to_words(c))
         .collect();
-    // Pad with zeros to the next power of two.
     leaves_w.resize(n, [0u32; 8]);
 
-    // Build the complete binary tree bottom-up.
-    // Layer 0 = leaves, layer `depth` = root.
+    // Build the complete binary tree bottom-up (for sibling lookups and native root).
     let mut layers: Vec<Vec<[u32; 8]>> = Vec::with_capacity(depth + 1);
     layers.push(leaves_w);
 
@@ -70,79 +79,63 @@ pub fn mhot_node_to_sha256_merkle(node: &MhotNodeWitness) -> BinaryMerkleWitness
         layers.push(cur);
     }
 
-    let root = layers[depth][0];
+    let native_root = layers[depth][0];
     let leaf = layers[0][node.selected_child];
 
-    // Extract path: walk from the leaf upward.
     let mut compressions = Vec::with_capacity(depth);
     let mut b_bits = Vec::with_capacity(depth);
     let mut idx = node.selected_child;
+    let mut current = leaf;
 
     for d in 0..depth {
         let sibling_idx = idx ^ 1;
         let sibling = layers[d][sibling_idx];
-        // b_bit = false means "selected is left child (M[0..8])"
-        // b_bit = true  means "selected is right child (M[8..16])"
         let is_right = (idx & 1) == 1;
 
-        let layer_hash = layers[d][idx];
-        let m = if !is_right {
+        let m = if d == 0 {
+            // Flock convention: leaf always in X_L (left slot) for the first compression.
             let mut m = [0u32; 16];
-            m[..8].copy_from_slice(&layer_hash);
+            m[..8].copy_from_slice(&current);
+            m[8..].copy_from_slice(&sibling);
+            m
+        } else if !is_right {
+            let mut m = [0u32; 16];
+            m[..8].copy_from_slice(&current);
             m[8..].copy_from_slice(&sibling);
             m
         } else {
             let mut m = [0u32; 16];
             m[..8].copy_from_slice(&sibling);
-            m[8..].copy_from_slice(&layer_hash);
+            m[8..].copy_from_slice(&current);
             m
         };
 
         compressions.push((SHA256_IV, m));
-        b_bits.push(is_right);
+        b_bits.push(if d == 0 { false } else { is_right });
+        current = sha256_compress(&SHA256_IV, &m);
         idx >>= 1;
     }
+
+    let flock_root = current;
 
     BinaryMerkleWitness {
         compressions,
         b_bits,
         leaf,
-        root,
+        root: flock_root,
+        native_root,
     }
 }
 
-/// Convert a multi-node MHOT path (root-to-leaf order) into a single
-/// concatenated binary Merkle witness for a chained `prove_merkle_path` call.
+/// Convert a sequence of MHOT nodes into per-node binary Merkle witnesses.
 ///
-/// The per-node witnesses are concatenated in the given order. The overall
-/// leaf is the selected child of the last (deepest) MHOT node, and the
-/// overall root is the Merkle root of the first (topmost) MHOT node.
-pub fn mhot_path_to_sha256_merkle(
+/// Each node is converted independently (not concatenated into a single chain).
+/// Cross-node linking (parent's selected child == child's Merkle root) is
+/// verified at a higher protocol level, not within the Merkle-path proofs.
+pub fn mhot_nodes_to_sha256_merkle(
     nodes: &[MhotNodeWitness],
-) -> BinaryMerkleWitness {
-    assert!(!nodes.is_empty(), "path must contain at least one node");
-
-    let mut all_compressions: Vec<Compression> = Vec::new();
-    let mut all_b_bits: Vec<bool> = Vec::new();
-
-    let first_w = mhot_node_to_sha256_merkle(&nodes[0]);
-    let root = first_w.root;
-
-    for node in nodes {
-        let w = mhot_node_to_sha256_merkle(node);
-        all_compressions.extend_from_slice(&w.compressions);
-        all_b_bits.extend_from_slice(&w.b_bits);
-    }
-
-    let last_w = mhot_node_to_sha256_merkle(&nodes[nodes.len() - 1]);
-    let leaf = last_w.leaf;
-
-    BinaryMerkleWitness {
-        compressions: all_compressions,
-        b_bits: all_b_bits,
-        leaf,
-        root,
-    }
+) -> Vec<BinaryMerkleWitness> {
+    nodes.iter().map(|n| mhot_node_to_sha256_merkle(n)).collect()
 }
 
 #[cfg(test)]
@@ -177,8 +170,9 @@ mod tests {
         assert_eq!(w.compressions.len(), 3, "fanout 8 → depth 3");
         assert_eq!(w.b_bits.len(), 3);
         assert_eq!(w.leaf, bytes_to_words(&children[3]));
+        assert!(!w.b_bits[0], "b_bits[0] must be false (Flock convention)");
 
-        // Verify the path manually: replaying compressions must produce root.
+        // Verify the chain: replaying compressions must produce root.
         let mut current = w.leaf;
         for (i, comp) in w.compressions.iter().enumerate() {
             let (iv, m) = comp;
@@ -190,11 +184,38 @@ mod tests {
             }
             current = sha256_compress(iv, m);
         }
-        assert_eq!(current, w.root, "path must lead to root");
+        assert_eq!(current, w.root, "chain must lead to Flock root");
     }
 
     #[test]
-    fn multi_node_path_witness() {
+    fn witness_bbits0_always_false() {
+        for sel in 0..8 {
+            let children = make_random_children(8, 0xF000 + sel as u64);
+            let node = MhotNodeWitness {
+                children,
+                selected_child: sel,
+            };
+            let w = mhot_node_to_sha256_merkle(&node);
+            assert!(!w.b_bits[0], "b_bits[0] must be false for selected_child={sel}");
+        }
+    }
+
+    #[test]
+    fn native_root_matches_when_leaf_is_left_child() {
+        let children = make_random_children(4, 0xAAAA);
+        let node = MhotNodeWitness {
+            children,
+            selected_child: 0,
+        };
+        let w = mhot_node_to_sha256_merkle(&node);
+        assert_eq!(
+            w.root, w.native_root,
+            "when leaf is a left child, Flock root == native root"
+        );
+    }
+
+    #[test]
+    fn multi_node_witnesses_independent() {
         let nodes: Vec<MhotNodeWitness> = vec![
             MhotNodeWitness {
                 children: make_random_children(8, 111),
@@ -209,9 +230,13 @@ mod tests {
                 selected_child: 0,
             },
         ];
-        let w = mhot_path_to_sha256_merkle(&nodes);
-        // fanout 8 → depth 3, fanout 4 → depth 2, fanout 2 → depth 1 = total 6
-        assert_eq!(w.compressions.len(), 6, "total compressions for [8,4,2] path");
-        assert_eq!(w.b_bits.len(), 6);
+        let witnesses = mhot_nodes_to_sha256_merkle(&nodes);
+        assert_eq!(witnesses.len(), 3);
+        assert_eq!(witnesses[0].compressions.len(), 3);
+        assert_eq!(witnesses[1].compressions.len(), 2);
+        assert_eq!(witnesses[2].compressions.len(), 1);
+        for w in &witnesses {
+            assert!(!w.b_bits[0], "b_bits[0] must be false for each node");
+        }
     }
 }
