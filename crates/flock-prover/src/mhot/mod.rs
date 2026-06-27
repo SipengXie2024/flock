@@ -1,5 +1,6 @@
 pub mod content;
 pub mod hash_only;
+pub mod membership;
 pub mod merkle_membership;
 pub mod mhot_to_sha256;
 pub mod multi_base;
