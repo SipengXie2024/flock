@@ -154,4 +154,30 @@ mod mhot_multiproof_tests {
             );
         }
     }
+
+    #[test]
+    fn flock_multiproof_full_scaling() {
+        let fanouts = &[8, 4, 2];
+        eprintln!();
+        eprintln!("=== Flock MHOT Multiproof Scaling (keccak3, x86) ===");
+        eprintln!("{:>8} {:>10} {:>10} {:>10} {:>10}",
+            "n_paths", "prove_ms", "verify_ms", "total_ms", "per_path");
+        eprintln!("{}", "-".repeat(55));
+
+        for &n_paths in &[1, 2, 4, 8, 16, 32, 64, 128, 512, 1024, 2048, 4096, 8192, 16384] {
+            let paths = same_root_paths(n_paths, fanouts);
+
+            let t0 = Instant::now();
+            let proof = prove_mhot_multiproof(&paths);
+            let prove_ms = t0.elapsed().as_secs_f64() * 1e3;
+
+            let t1 = Instant::now();
+            verify_mhot_multiproof(&proof).expect("must verify");
+            let verify_ms = t1.elapsed().as_secs_f64() * 1e3;
+
+            let total = prove_ms + verify_ms;
+            eprintln!("{:>8} {:>10.1} {:>10.1} {:>10.1} {:>9.3}",
+                n_paths, prove_ms, verify_ms, total, total / n_paths as f64);
+        }
+    }
 }
