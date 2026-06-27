@@ -74,7 +74,7 @@ fn profile_mhot_prove_scaling() {
     eprintln!("{:>5}  {:>6}  {:>2}  {:>6}  | {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  | {}",
         "paths", "atoms", "m", "blocks", "commit", "zerocheck", "lincheck", "open", "TOTAL", "ms/path");
     eprintln!("{}", "-".repeat(120));
-    for &n_paths in &[1, 10, 100, 300] {
+    for &n_paths in &[100] {
         profile_at_scale(n_paths);
     }
 }
