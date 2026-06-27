@@ -34,6 +34,321 @@ pub type Hash = [u8; 32];
 /// independent nodes within a level) leaves that on the table.
 ///
 /// Digests are byte-identical to `Sha256::digest`.
+/// 4-way interleaved SHA-256 using x86_64 AVX2 intrinsics.
+///
+/// Each `__m256i` holds 8 × u32 lanes. We pack 4 independent SHA-256
+/// states into lanes 0..3 (the upper 4 lanes mirror a second quad when
+/// doing 8-way, but here we always process quads of 4). All SHA-256
+/// round operations (Ch, Maj, Sigma, message schedule) are pure
+/// bitwise + add, so they vectorise trivially across lanes.
+///
+/// Digests are byte-identical to `sha2::Sha256::digest`.
+#[cfg(target_arch = "x86_64")]
+mod sha256x4_x86 {
+    use super::Hash;
+
+    #[cfg(target_arch = "x86_64")]
+    use core::arch::x86_64::*;
+
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
+    ];
+
+    const IV: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+        0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+    ];
+
+    /// Right-rotate a 32-bit value packed in each lane of a __m256i.
+    macro_rules! rotr32 {
+        ($x:expr, $n:literal) => {{
+            // SAFETY: caller ensures AVX2 is available.
+            _mm256_or_si256(
+                _mm256_srli_epi32($x, $n),
+                _mm256_slli_epi32($x, 32 - $n),
+            )
+        }};
+    }
+
+    // SAFETY for all helpers below: caller ensures AVX2 is available.
+    // Functions are `unsafe fn` (body is an unsafe context), so no inner
+    // `unsafe {}` block is needed; intrinsics are called directly.
+
+    // SAFETY for all helpers below: they are `unsafe fn` with
+    // `#[target_feature(enable = "avx2")]`, making the body an implicit
+    // unsafe context in edition 2024. Callers are responsible for ensuring
+    // AVX2 is available (enforced by the same target_feature gate).
+
+    /// SHA-256 Ch(e, f, g) = (e & f) ^ (~e & g)
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn ch(e: __m256i, f: __m256i, g: __m256i) -> __m256i {
+        _mm256_xor_si256(
+            _mm256_and_si256(e, f),
+            _mm256_andnot_si256(e, g),
+        )
+    }
+
+    /// SHA-256 Maj(a, b, c) = (a & b) ^ (a & c) ^ (b & c)
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn maj(a: __m256i, b: __m256i, c: __m256i) -> __m256i {
+        _mm256_xor_si256(
+            _mm256_xor_si256(
+                _mm256_and_si256(a, b),
+                _mm256_and_si256(a, c),
+            ),
+            _mm256_and_si256(b, c),
+        )
+    }
+
+    /// SHA-256 big Sigma0(a) = ROTR(2, a) ^ ROTR(13, a) ^ ROTR(22, a)
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn bsig0(a: __m256i) -> __m256i {
+        _mm256_xor_si256(
+            _mm256_xor_si256(rotr32!(a, 2), rotr32!(a, 13)),
+            rotr32!(a, 22),
+        )
+    }
+
+    /// SHA-256 big Sigma1(e) = ROTR(6, e) ^ ROTR(11, e) ^ ROTR(25, e)
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn bsig1(e: __m256i) -> __m256i {
+        _mm256_xor_si256(
+            _mm256_xor_si256(rotr32!(e, 6), rotr32!(e, 11)),
+            rotr32!(e, 25),
+        )
+    }
+
+    /// SHA-256 small sigma0(x) = ROTR(7, x) ^ ROTR(18, x) ^ SHR(3, x)
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn ssig0(x: __m256i) -> __m256i {
+        _mm256_xor_si256(
+            _mm256_xor_si256(rotr32!(x, 7), rotr32!(x, 18)),
+            _mm256_srli_epi32(x, 3),
+        )
+    }
+
+    /// SHA-256 small sigma1(x) = ROTR(17, x) ^ ROTR(19, x) ^ SHR(10, x)
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn ssig1(x: __m256i) -> __m256i {
+        _mm256_xor_si256(
+            _mm256_xor_si256(rotr32!(x, 17), rotr32!(x, 19)),
+            _mm256_srli_epi32(x, 10),
+        )
+    }
+
+    /// Load 4 big-endian u32 words at the same offset from 4 different
+    /// message blocks, returning them packed into lanes [0..3] of a
+    /// __m256i (lanes 4..7 are zero).
+    ///
+    /// `word_idx` is the 0-based u32 index within the 64-byte block.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn load_msg_word(blocks: &[*const u8; 4], word_idx: usize) -> __m256i {
+        // SAFETY: caller ensures each pointer is valid for 64 bytes and AVX2.
+        unsafe {
+            let off = word_idx * 4;
+            let w0 = u32::from_be_bytes([
+                *blocks[0].add(off),
+                *blocks[0].add(off + 1),
+                *blocks[0].add(off + 2),
+                *blocks[0].add(off + 3),
+            ]);
+            let w1 = u32::from_be_bytes([
+                *blocks[1].add(off),
+                *blocks[1].add(off + 1),
+                *blocks[1].add(off + 2),
+                *blocks[1].add(off + 3),
+            ]);
+            let w2 = u32::from_be_bytes([
+                *blocks[2].add(off),
+                *blocks[2].add(off + 1),
+                *blocks[2].add(off + 2),
+                *blocks[2].add(off + 3),
+            ]);
+            let w3 = u32::from_be_bytes([
+                *blocks[3].add(off),
+                *blocks[3].add(off + 1),
+                *blocks[3].add(off + 2),
+                *blocks[3].add(off + 3),
+            ]);
+            _mm256_setr_epi32(
+                w0 as i32, w1 as i32, w2 as i32, w3 as i32,
+                0, 0, 0, 0,
+            )
+        }
+    }
+
+    /// Compress one 64-byte block from each of 4 independent messages.
+    ///
+    /// `state` holds [a, b, c, d, e, f, g, h] as 8 __m256i, each with 4
+    /// lanes (one per message). Modified in place (state += round result).
+    #[target_feature(enable = "avx2")]
+    unsafe fn compress4(state: &mut [__m256i; 8], blocks: &[*const u8; 4]) {
+        // SAFETY: caller ensures AVX2 is available, pointers valid for 64 bytes.
+        unsafe {
+            let mut w = [_mm256_setzero_si256(); 64];
+
+            for t in 0..16 {
+                w[t] = load_msg_word(blocks, t);
+            }
+
+            // Message schedule: W[t] = ssig1(W[t-2]) + W[t-7] + ssig0(W[t-15]) + W[t-16]
+            for t in 16..64 {
+                w[t] = _mm256_add_epi32(
+                    _mm256_add_epi32(ssig1(w[t - 2]), w[t - 7]),
+                    _mm256_add_epi32(ssig0(w[t - 15]), w[t - 16]),
+                );
+            }
+
+            let state_save = *state;
+            let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = *state;
+
+            for t in 0..64 {
+                let ki = _mm256_set1_epi32(K[t] as i32);
+
+                // T1 = h + bsig1(e) + ch(e,f,g) + K[t] + W[t]
+                let t1 = _mm256_add_epi32(
+                    _mm256_add_epi32(
+                        _mm256_add_epi32(h, bsig1(e)),
+                        _mm256_add_epi32(ch(e, f, g), ki),
+                    ),
+                    w[t],
+                );
+                // T2 = bsig0(a) + maj(a,b,c)
+                let t2 = _mm256_add_epi32(bsig0(a), maj(a, b, c));
+
+                h = g;
+                g = f;
+                f = e;
+                e = _mm256_add_epi32(d, t1);
+                d = c;
+                c = b;
+                b = a;
+                a = _mm256_add_epi32(t1, t2);
+            }
+
+            state[0] = _mm256_add_epi32(a, state_save[0]);
+            state[1] = _mm256_add_epi32(b, state_save[1]);
+            state[2] = _mm256_add_epi32(c, state_save[2]);
+            state[3] = _mm256_add_epi32(d, state_save[3]);
+            state[4] = _mm256_add_epi32(e, state_save[4]);
+            state[5] = _mm256_add_epi32(f, state_save[5]);
+            state[6] = _mm256_add_epi32(g, state_save[6]);
+            state[7] = _mm256_add_epi32(h, state_save[7]);
+        }
+    }
+
+    /// Extract the u32 at the given lane index (0..7) from a __m256i.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn extract_lane(v: __m256i, lane: usize) -> u32 {
+        // SAFETY: AVX2 ensured by caller; tmp is 32-byte aligned on stack.
+        unsafe {
+            let mut tmp = [0u32; 8];
+            _mm256_storeu_si256(tmp.as_mut_ptr() as *mut __m256i, v);
+            tmp[lane]
+        }
+    }
+
+    /// Hash 4 equal-length inputs, producing 4 standard SHA-256 digests.
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn hash4_equal_len(inputs: [&[u8]; 4], out: &mut [Hash]) {
+        let len = inputs[0].len();
+        debug_assert!(inputs.iter().all(|x| x.len() == len));
+        debug_assert!(out.len() >= 4);
+
+        // SAFETY: AVX2 availability ensured by caller (runtime detection in hash4).
+        unsafe {
+            let mut state: [__m256i; 8] = [
+                _mm256_set1_epi32(IV[0] as i32),
+                _mm256_set1_epi32(IV[1] as i32),
+                _mm256_set1_epi32(IV[2] as i32),
+                _mm256_set1_epi32(IV[3] as i32),
+                _mm256_set1_epi32(IV[4] as i32),
+                _mm256_set1_epi32(IV[5] as i32),
+                _mm256_set1_epi32(IV[6] as i32),
+                _mm256_set1_epi32(IV[7] as i32),
+            ];
+
+            let n_full = len / 64;
+            for blk in 0..n_full {
+                let off = blk * 64;
+                compress4(
+                    &mut state,
+                    &[
+                        inputs[0].as_ptr().add(off),
+                        inputs[1].as_ptr().add(off),
+                        inputs[2].as_ptr().add(off),
+                        inputs[3].as_ptr().add(off),
+                    ],
+                );
+            }
+
+            // Tail: remaining bytes + 0x80 + zero pad + 64-bit BE bit length.
+            let rem = len % 64;
+            let bit_len = (len as u64) * 8;
+            let n_tail = if rem < 56 { 1 } else { 2 };
+            let mut tails = [[0u8; 128]; 4];
+            for i in 0..4 {
+                tails[i][..rem].copy_from_slice(&inputs[i][len - rem..]);
+                tails[i][rem] = 0x80;
+                tails[i][n_tail * 64 - 8..n_tail * 64]
+                    .copy_from_slice(&bit_len.to_be_bytes());
+            }
+            for blk in 0..n_tail {
+                let off = blk * 64;
+                compress4(
+                    &mut state,
+                    &[
+                        tails[0].as_ptr().add(off),
+                        tails[1].as_ptr().add(off),
+                        tails[2].as_ptr().add(off),
+                        tails[3].as_ptr().add(off),
+                    ],
+                );
+            }
+
+            for msg_idx in 0..4 {
+                for word_idx in 0..8 {
+                    let w = extract_lane(state[word_idx], msg_idx);
+                    out[msg_idx][word_idx * 4..word_idx * 4 + 4]
+                        .copy_from_slice(&w.to_be_bytes());
+                }
+            }
+        }
+    }
+
+    /// Safe wrapper: checks AVX2 at runtime, then calls the unsafe
+    /// `hash4_equal_len`. Falls back to scalar if AVX2 is absent (should
+    /// not happen on the target environment).
+    pub fn hash4(inputs: [&[u8]; 4], out: &mut [Hash]) {
+        if is_x86_feature_detected!("avx2") {
+            // SAFETY: feature detection confirmed AVX2 is available.
+            unsafe { hash4_equal_len(inputs, out) }
+        } else {
+            for (i, inp) in inputs.iter().enumerate() {
+                use sha2::{Digest, Sha256};
+                out[i] = Sha256::digest(inp).into();
+            }
+        }
+    }
+}
+
 #[cfg(all(target_arch = "aarch64", target_feature = "sha2"))]
 mod sha256x4 {
     use super::Hash;
@@ -57,7 +372,7 @@ mod sha256x4 {
 
     /// One interleaved compression round over 4 independent states.
     /// `blocks[i]` must be ≥ 64 bytes; only the first 64 are consumed.
-    #[inline(always)]
+    #[inline]
     unsafe fn compress4(
         abcd: &mut [uint32x4_t; 4],
         efgh: &mut [uint32x4_t; 4],
@@ -298,7 +613,37 @@ pub fn merkle_tree(data: &[u8], num_leaves: usize) -> Vec<Hash> {
                 }
             });
     }
-    #[cfg(not(all(target_arch = "aarch64", target_feature = "sha2")))]
+    #[cfg(all(not(all(target_arch = "aarch64", target_feature = "sha2")), target_arch = "x86_64"))]
+    {
+        tree[..num_leaves]
+            .par_chunks_mut(4)
+            .zip(data.par_chunks(4 * leaf_size))
+            .for_each(|(outs, leaves)| {
+                if outs.len() == 4 {
+                    #[cfg(feature = "hash-count")]
+                    {
+                        use std::sync::atomic::Ordering::Relaxed;
+                        hash_count::LEAF_CALLS.fetch_add(4, Relaxed);
+                        hash_count::LEAF_COMPRESSIONS
+                            .fetch_add(4 * hash_count::sha256_blocks(leaf_size), Relaxed);
+                    }
+                    sha256x4_x86::hash4(
+                        [
+                            &leaves[..leaf_size],
+                            &leaves[leaf_size..2 * leaf_size],
+                            &leaves[2 * leaf_size..3 * leaf_size],
+                            &leaves[3 * leaf_size..],
+                        ],
+                        outs,
+                    );
+                } else {
+                    for (out, leaf) in outs.iter_mut().zip(leaves.chunks(leaf_size)) {
+                        *out = hash_leaf(leaf);
+                    }
+                }
+            });
+    }
+    #[cfg(not(any(all(target_arch = "aarch64", target_feature = "sha2"), target_arch = "x86_64")))]
     {
         tree[..num_leaves]
             .par_iter_mut()
@@ -359,7 +704,46 @@ pub fn merkle_tree(data: &[u8], num_leaves: usize) -> Vec<Hash> {
                     .for_each(|(outs, children)| hash_quad(outs, children));
             }
         }
-        #[cfg(not(all(target_arch = "aarch64", target_feature = "sha2")))]
+        #[cfg(all(not(all(target_arch = "aarch64", target_feature = "sha2")), target_arch = "x86_64"))]
+        {
+            // SAFETY: `read` is a contiguous &[Hash] (each 32 bytes); reinterpreting
+            // as &[u8] is valid because Hash = [u8; 32] has alignment 1.
+            let read_bytes: &[u8] =
+                unsafe { core::slice::from_raw_parts(read.as_ptr() as *const u8, read.len() * 32) };
+            let hash_quad = |outs: &mut [Hash], children: &[u8]| {
+                if outs.len() == 4 {
+                    #[cfg(feature = "hash-count")]
+                    hash_count::PAIR_CALLS.fetch_add(4, std::sync::atomic::Ordering::Relaxed);
+                    sha256x4_x86::hash4(
+                        [
+                            &children[..64],
+                            &children[64..128],
+                            &children[128..192],
+                            &children[192..256],
+                        ],
+                        outs,
+                    );
+                } else {
+                    for (i, out) in outs.iter_mut().enumerate() {
+                        let l: &Hash = children[i * 64..i * 64 + 32].try_into().unwrap();
+                        let r: &Hash = children[i * 64 + 32..i * 64 + 64].try_into().unwrap();
+                        *out = hash_pair(l, r);
+                    }
+                }
+            };
+            const SERIAL_LEVEL_NODES: usize = 1024;
+            if write.len() <= SERIAL_LEVEL_NODES {
+                for (outs, children) in write.chunks_mut(4).zip(read_bytes.chunks(256)) {
+                    hash_quad(outs, children);
+                }
+            } else {
+                write
+                    .par_chunks_mut(4)
+                    .zip(read_bytes.par_chunks(256))
+                    .for_each(|(outs, children)| hash_quad(outs, children));
+            }
+        }
+        #[cfg(not(any(all(target_arch = "aarch64", target_feature = "sha2"), target_arch = "x86_64")))]
         {
             write
                 .par_iter_mut()
@@ -1004,5 +1388,126 @@ mod tests {
             positions.len(),
             log_n
         );
+    }
+
+    #[test]
+    fn sha256x4_x86_matches_scalar() {
+        let inputs: [[u8; 64]; 4] = [
+            {
+                let mut a = [0u8; 64];
+                for (i, b) in a.iter_mut().enumerate() {
+                    *b = (i as u8).wrapping_mul(0x37);
+                }
+                a
+            },
+            {
+                let mut a = [0u8; 64];
+                for (i, b) in a.iter_mut().enumerate() {
+                    *b = (i as u8).wrapping_add(0xAB);
+                }
+                a
+            },
+            {
+                let mut a = [0u8; 64];
+                for (i, b) in a.iter_mut().enumerate() {
+                    *b = (i as u8) ^ 0xCD;
+                }
+                a
+            },
+            {
+                let mut a = [0u8; 64];
+                for (i, b) in a.iter_mut().enumerate() {
+                    *b = ((i * 7 + 3) & 0xFF) as u8;
+                }
+                a
+            },
+        ];
+
+        let scalar: Vec<Hash> = inputs
+            .iter()
+            .map(|inp| Sha256::digest(inp).into())
+            .collect();
+
+        let mut batch = [[0u8; 32]; 4];
+        #[cfg(target_arch = "x86_64")]
+        {
+            super::sha256x4_x86::hash4(
+                [&inputs[0][..], &inputs[1][..], &inputs[2][..], &inputs[3][..]],
+                &mut batch,
+            );
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            for i in 0..4 {
+                batch[i] = Sha256::digest(&inputs[i]).into();
+            }
+        }
+
+        for i in 0..4 {
+            assert_eq!(
+                batch[i], scalar[i],
+                "sha256x4 lane {i} differs from scalar"
+            );
+        }
+    }
+
+    #[test]
+    fn sha256x4_x86_various_lengths() {
+        for len in [1, 7, 32, 55, 56, 63, 64, 100, 128, 200] {
+            let inputs: Vec<Vec<u8>> = (0..4u8)
+                .map(|seed| {
+                    (0..len)
+                        .map(|i| (i as u8).wrapping_mul(seed.wrapping_add(0x31)))
+                        .collect()
+                })
+                .collect();
+
+            let scalar: Vec<Hash> = inputs
+                .iter()
+                .map(|inp| Sha256::digest(inp).into())
+                .collect();
+
+            let mut batch = [[0u8; 32]; 4];
+            #[cfg(target_arch = "x86_64")]
+            {
+                super::sha256x4_x86::hash4(
+                    [&inputs[0], &inputs[1], &inputs[2], &inputs[3]],
+                    &mut batch,
+                );
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                for i in 0..4 {
+                    batch[i] = Sha256::digest(&inputs[i]).into();
+                }
+            }
+
+            for i in 0..4 {
+                assert_eq!(
+                    batch[i], scalar[i],
+                    "sha256x4 lane {i} differs at len={len}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn merkle_tree_x86_matches_scalar() {
+        for (n_leaves, leaf_size) in [
+            (4, 32),
+            (8, 64),
+            (16, 8),
+            (64, 100),
+            (256, 16),
+            (1024, 64),
+        ] {
+            let data = random_data(n_leaves, leaf_size, 0xDEAD_CAFE);
+            let tree = merkle_tree(&data, n_leaves);
+            let seq = merkle_tree_sequential(&data, n_leaves);
+            assert_eq!(
+                tree, seq,
+                "merkle_tree (x86 path) differs from sequential at n_leaves={n_leaves} leaf_size={leaf_size}"
+            );
+        }
     }
 }
