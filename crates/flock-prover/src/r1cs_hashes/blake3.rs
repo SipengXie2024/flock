@@ -32,15 +32,15 @@
 //! ## Witness layout per compression block (`k_log = 14`, `k = 16,384`)
 //!
 //! ```text
-//!   z[0]                       = 1                    (constant)
-//!   z[1     ..    257)         = cv[0..8]   (8 × 32-bit words)
-//!   z[257   ..    769)         = m[0..16]   (16 × 32-bit words)
-//!   z[769   ..    801)         = counter_lo
-//!   z[801   ..    833)         = counter_hi
-//!   z[833   ..    865)         = block_len
-//!   z[865   ..    897)         = flags
-//!   z[897   .. 14,897)         = 56 G blocks × 250 bits each
-//!   z[14,897 .. 15,153)        = out_lo[0..8] = state[0..8] ^ state[8..16]
+//!   z[0     ..    256)         = cv[0..8]   (8 x 32-bit words, slot 0)
+//!   z[256   ..    512)         = out_lo[0..8] (slot 1)
+//!   z[512   ..  1,024)         = m[0..16]   (16 x 32-bit words, slots 2-3)
+//!   z[1,024]                   = 1          (constant)
+//!   z[1,025 ..  1,057)         = counter_lo
+//!   z[1,057 ..  1,089)         = counter_hi
+//!   z[1,089 ..  1,121)         = block_len
+//!   z[1,121 ..  1,153)         = flags
+//!   z[1,153 .. 15,153)         = 56 G blocks x 250 bits each
 //!   z[15,153 .. 15,409)        = out_hi[0..8] = state[8..16] ^ cv[0..8]
 //!   z[15,409 .. 16,384)        = padding (forced to 0 by empty rows)
 //! ```
@@ -164,20 +164,22 @@ pub const G_MSG_IDX: [[usize; 2]; N_G_PER_ROUND] = [
 // Layout positions (bit indices into the per-block z slice of length K)
 // ---------------------------------------------------------------------------
 
-// **I/O-aligned layout** for the hash chain (forked from `blake3`): the input
-// chaining value `cv` lives in aligned slot 0 and the output chaining value
-// `out_lo` (= state[0..8] ^ state[8..16]) in aligned slot 1 — each a clean
-// 256-bit (`2^8`) window, so the chain shift argument folds them via a single
-// tensor opening. cv/out_lo are *exactly* 256 bits, so the slots have NO
-// interior padding. Everything else (const, m, counters, flags, G-blocks,
-// out_hi) packs after the two slots. The re-layout is purely a change of these
-// base offsets — all bit placement goes through the `*_bit` accessors below.
+// **4-slot-aligned layout** for both the hash chain and Merkle path protocols:
+// the first 4 aligned 256-bit slots are:
+//   slot 0 [0..256)   = cv       (input chaining value)
+//   slot 1 [256..512) = out_lo   (output chaining value)
+//   slot 2 [512..768) = m[0..8]  (message words 0-7, left half)
+//   slot 3 [768..1024)= m[8..16] (message words 8-15, right half)
+// The chain protocol uses slots 0-1; the Merkle path protocol uses all 4
+// (Z=out_lo, X_L=m_lo, X_R=m_hi). cv/out_lo/m are *exactly* 256 bits each,
+// so the slots have NO interior padding. Everything else (const, counters,
+// flags, G-blocks, out_hi) packs after the 4-slot region.
 pub const SLOT_BITS: usize = 256; // 2^8, one 256-bit chaining value
 pub const CV_BASE: usize = 0; // input region, slot 0: [0, 256)
 pub const OUT_LO_BASE: usize = SLOT_BITS; // output region, slot 1: [256, 512)
-pub const Z_CONST_POS: usize = 2 * SLOT_BITS; // 512
-pub const M_BASE: usize = Z_CONST_POS + 1; // 513
-pub const T_LO_BASE: usize = M_BASE + 16 * WORD_BITS; // 1025
+pub const M_BASE: usize = 2 * SLOT_BITS; // 512 (slots 2-3: m[0..16])
+pub const Z_CONST_POS: usize = M_BASE + 16 * WORD_BITS; // 1024
+pub const T_LO_BASE: usize = Z_CONST_POS + 1; // 1025
 pub const T_HI_BASE: usize = T_LO_BASE + WORD_BITS; // 1057
 pub const BLEN_BASE: usize = T_HI_BASE + WORD_BITS; // 1089
 pub const FLAGS_BASE: usize = BLEN_BASE + WORD_BITS; // 1121
@@ -1646,6 +1648,203 @@ impl Blake3Setup {
 }
 
 // ---------------------------------------------------------------------------
+// Merkle path: BLAKE3 geometry + thin wrappers over the generic Merkle core.
+// ---------------------------------------------------------------------------
+
+pub use super::merkle_path_common::{MerklePathProof, MerklePathVerifyError};
+
+/// BLAKE3's 4-slot geometry for the Merkle-path protocol. The block starts
+/// with four 256-bit slots in order:
+/// - slot 0 (bytes 0..32)    = `cv`     (the input chaining value)
+/// - slot 1 (bytes 32..64)   = `out_lo` (= z_i, the per-hash output) -> `Z`
+/// - slot 2 (bytes 64..96)   = `m[0..8]`  (left 8 message words)    -> `X_L`
+/// - slot 3 (bytes 96..128)  = `m[8..16]` (right 8 message words)   -> `X_R`
+pub const MERKLE_LAYOUT: super::merkle_path_common::MerkleLayout =
+    super::merkle_path_common::MerkleLayout {
+        k_log: K_LOG,
+        k_skip: K_SKIP,
+        region_log: 8,
+        region_bits: 256,
+        slot_base_byte_off: 0,
+        z_slot: 1,
+        x_l_slot: 2,
+        x_r_slot: 3,
+    };
+
+impl Blake3Setup {
+    /// Prove a Merkle path of `n_blocks` BLAKE3 compressions. For each
+    /// compression, the message `m` encodes a parent hash: the `b[i]`-selected
+    /// half holds the previous output CV, the other half holds the sibling.
+    /// `cv` is the BLAKE3 IV for every compression (standard Merkle tree mode).
+    pub fn prove_merkle_path<Ch: flock_core::challenger::Challenger>(
+        &self,
+        blocks: &[Compression],
+        b_bits: &[bool],
+        challenger: &mut Ch,
+    ) -> (MerklePathProof, flock_core::pcs::Commitment) {
+        assert_eq!(blocks.len(), self.n_blocks);
+        assert_eq!(
+            self.n_blocks,
+            self.n_block_slots(),
+            "prove_merkle_path requires n_blocks to exactly fill \
+             n_block_slots (no padding); got n_blocks={}, \
+             n_block_slots={}. Use a power-of-2 >= 8.",
+            self.n_blocks,
+            self.n_block_slots(),
+        );
+        assert_eq!(
+            b_bits.len(),
+            self.n_block_slots(),
+            "bit vector length mismatch"
+        );
+        let (z_packed, a_packed, b_packed, z_lincheck) =
+            generate_witness_with_ab_packed_and_lincheck(blocks, self.n_blocks_log());
+        super::merkle_path_common::prove_merkle_path_generic(
+            &self.r1cs,
+            &self.pcs_params,
+            &MERKLE_LAYOUT,
+            z_packed,
+            a_packed,
+            b_packed,
+            z_lincheck,
+            b_bits,
+            self.r1cs.csc_lincheck_circuit(),
+            challenger,
+        )
+    }
+
+    /// Verify a [`MerklePathProof`] against public `leaf` and `root` (each as
+    /// 8 x u32 words) and the public bit vector `b`.
+    pub fn verify_merkle_path<Ch: flock_core::challenger::Challenger>(
+        &self,
+        commitment: &flock_core::pcs::Commitment,
+        proof: &MerklePathProof,
+        leaf: &[u32; 8],
+        root: &[u32; 8],
+        b_bits: &[bool],
+        challenger: &mut Ch,
+    ) -> Result<(), MerklePathVerifyError> {
+        assert_eq!(
+            self.n_blocks,
+            self.n_block_slots(),
+            "verify_merkle_path requires n_blocks to exactly fill \
+             n_block_slots (no padding)",
+        );
+        assert_eq!(
+            b_bits.len(),
+            self.n_block_slots(),
+            "bit vector length mismatch"
+        );
+        let n_log = self.n_blocks_log();
+        let leaf_phys = cv_to_phys_bits(leaf);
+        let root_phys = cv_to_phys_bits(root);
+        super::merkle_path_common::verify_merkle_path_generic(
+            &self.r1cs,
+            &MERKLE_LAYOUT,
+            commitment,
+            proof,
+            n_log,
+            &leaf_phys,
+            &root_phys,
+            b_bits,
+            self.r1cs.csc_lincheck_circuit(),
+            challenger,
+        )
+    }
+
+    /// Prove `P = 2^path_log` independent BLAKE3 Merkle paths into a single
+    /// shared root.
+    pub fn prove_merkle_paths<Ch: flock_core::challenger::Challenger>(
+        &self,
+        path_log: usize,
+        blocks: &[Compression],
+        b_bits: &[bool],
+        challenger: &mut Ch,
+    ) -> (MerklePathProof, flock_core::pcs::Commitment) {
+        assert_eq!(blocks.len(), self.n_blocks);
+        assert_eq!(
+            self.n_blocks,
+            self.n_block_slots(),
+            "prove_merkle_paths requires n_blocks to exactly fill \
+             n_block_slots (no padding); got n_blocks={}, \
+             n_block_slots={}. Use a power-of-2 >= 8.",
+            self.n_blocks,
+            self.n_block_slots(),
+        );
+        assert_eq!(
+            b_bits.len(),
+            self.n_block_slots(),
+            "bit vector length mismatch"
+        );
+        assert!(
+            path_log <= self.n_blocks_log(),
+            "path_log {} > n_blocks_log {}",
+            path_log,
+            self.n_blocks_log(),
+        );
+        let (z_packed, a_packed, b_packed, z_lincheck) =
+            generate_witness_with_ab_packed_and_lincheck(blocks, self.n_blocks_log());
+        super::merkle_path_common::prove_merkle_paths_generic(
+            &self.r1cs,
+            &self.pcs_params,
+            &MERKLE_LAYOUT,
+            path_log,
+            z_packed,
+            a_packed,
+            b_packed,
+            z_lincheck,
+            b_bits,
+            self.r1cs.csc_lincheck_circuit(),
+            challenger,
+        )
+    }
+
+    /// Verify a multi-path [`MerklePathProof`] against `P = 2^path_log` public
+    /// leaves and a single shared `root`.
+    pub fn verify_merkle_paths<Ch: flock_core::challenger::Challenger>(
+        &self,
+        path_log: usize,
+        commitment: &flock_core::pcs::Commitment,
+        proof: &MerklePathProof,
+        leaves: &[[u32; 8]],
+        root: &[u32; 8],
+        b_bits: &[bool],
+        challenger: &mut Ch,
+    ) -> Result<(), MerklePathVerifyError> {
+        assert_eq!(
+            self.n_blocks,
+            self.n_block_slots(),
+            "verify_merkle_paths requires n_blocks to exactly fill \
+             n_block_slots (no padding)",
+        );
+        assert_eq!(
+            b_bits.len(),
+            self.n_block_slots(),
+            "bit vector length mismatch"
+        );
+        let n_paths = 1usize << path_log;
+        assert_eq!(leaves.len(), n_paths, "leaves must have length 2^path_log");
+        let n_log = self.n_blocks_log();
+        let leaves_phys: Vec<Vec<bool>> = leaves.iter().map(cv_to_phys_bits).collect();
+        let leaves_phys_refs: Vec<&[bool]> = leaves_phys.iter().map(|v| v.as_slice()).collect();
+        let root_phys = cv_to_phys_bits(root);
+        super::merkle_path_common::verify_merkle_paths_generic(
+            &self.r1cs,
+            &MERKLE_LAYOUT,
+            path_log,
+            commitment,
+            proof,
+            n_log,
+            &leaves_phys_refs,
+            &root_phys,
+            b_bits,
+            self.r1cs.csc_lincheck_circuit(),
+            challenger,
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1675,11 +1874,12 @@ mod tests {
 
     #[test]
     fn layout_constants() {
-        // I/O-aligned layout: cv in slot 0, out_lo in slot 1 (both 256-bit).
+        // 4-slot-aligned layout: cv slot 0, out_lo slot 1, m slots 2-3.
         assert_eq!(CV_BASE, 0);
         assert_eq!(OUT_LO_BASE, 256);
-        assert_eq!(Z_CONST_POS, 512);
-        assert_eq!(M_BASE, 513);
+        assert_eq!(M_BASE, 512);
+        assert_eq!(Z_CONST_POS, 1024);
+        assert_eq!(T_LO_BASE, 1025);
         assert_eq!(GS_BASE, 1153);
         assert_eq!(G_STRIDE, 250);
         assert_eq!(N_G, 56);
@@ -1688,6 +1888,7 @@ mod tests {
         assert!(USEFUL_BITS <= K);
         assert_eq!(CV_BASE % SLOT_BITS, 0);
         assert_eq!(OUT_LO_BASE % SLOT_BITS, 0);
+        assert_eq!(M_BASE % SLOT_BITS, 0);
     }
 
     /// Reference compression matches the `blake3` crate for empty input
@@ -2269,5 +2470,135 @@ mod chain_e2e_tests {
                 .verify_chain_basefold(&comm, &proof, &cv0, &cv_last, &mut chv)
                 .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod merkle_path_tests {
+    use super::*;
+    use flock_core::challenger::FsChallenger;
+
+    struct R(u64);
+    impl R {
+        fn nx(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E3779B97F4A7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+            z ^ (z >> 31)
+        }
+        fn w(&mut self) -> u32 {
+            self.nx() as u32
+        }
+        fn cv8(&mut self) -> [u32; 8] {
+            std::array::from_fn(|_| self.w())
+        }
+    }
+
+    /// Build an honest BLAKE3 Merkle path of `n` compressions.
+    ///
+    /// In BLAKE3's Merkle tree mode each parent node compresses two child CVs
+    /// into one parent CV. The compression uses the IV as `cv`, the two child
+    /// CVs concatenated as the 16-word message `m`, counter=0, block_len=64,
+    /// flags=PARENT (4). The output CV is `state[0..8]`.
+    ///
+    /// Returns `(blocks, leaf, root, b_bits)`.
+    fn honest_merkle_path(
+        n: usize,
+        seed: u64,
+    ) -> (Vec<Compression>, [u32; 8], [u32; 8], Vec<bool>) {
+        const PARENT: u32 = 4;
+        let mut rng = R(seed);
+        let leaf: [u32; 8] = rng.cv8();
+        let mut b_bits = vec![false; n];
+        for bit in b_bits.iter_mut().skip(1) {
+            *bit = rng.w() & 1 == 1;
+        }
+        let mut blocks = Vec::with_capacity(n);
+        let mut current = leaf;
+        for i in 0..n {
+            let sibling: [u32; 8] = rng.cv8();
+            let m: [u32; 16] = if !b_bits[i] {
+                let mut m = [0u32; 16];
+                m[..8].copy_from_slice(&current);
+                m[8..].copy_from_slice(&sibling);
+                m
+            } else {
+                let mut m = [0u32; 16];
+                m[..8].copy_from_slice(&sibling);
+                m[8..].copy_from_slice(&current);
+                m
+            };
+            let block: Compression = (BLAKE3_IV, m, 0u64, 64u32, PARENT);
+            let st = blake3_compress(&BLAKE3_IV, &m, 0, 64, PARENT);
+            current = {
+                let mut o = [0u32; 8];
+                o.copy_from_slice(&st[0..8]);
+                o
+            };
+            blocks.push(block);
+        }
+        (blocks, leaf, current, b_bits)
+    }
+
+    #[test]
+    fn prove_merkle_path_roundtrip() {
+        let setup = Blake3Setup::new(8);
+        let (blocks, leaf, root, b) =
+            honest_merkle_path(setup.n_block_slots(), 0xB3_3E2C);
+        let mut ch = FsChallenger::new(b"b3-merkle-test");
+        let (proof, commitment) = setup.prove_merkle_path(&blocks, &b, &mut ch);
+        let mut chv = FsChallenger::new(b"b3-merkle-test");
+        setup
+            .verify_merkle_path(&commitment, &proof, &leaf, &root, &b, &mut chv)
+            .expect("honest BLAKE3 merkle path must verify");
+    }
+
+    #[test]
+    fn verify_merkle_path_rejects_wrong_leaf() {
+        let setup = Blake3Setup::new(8);
+        let (blocks, leaf, root, b) =
+            honest_merkle_path(setup.n_block_slots(), 0xB3_DEAD);
+        let mut ch = FsChallenger::new(b"b3-merkle-test");
+        let (proof, commitment) = setup.prove_merkle_path(&blocks, &b, &mut ch);
+        let mut bad_leaf = leaf;
+        bad_leaf[0] ^= 1;
+        let mut chv = FsChallenger::new(b"b3-merkle-test");
+        let res = setup.verify_merkle_path(
+            &commitment, &proof, &bad_leaf, &root, &b, &mut chv,
+        );
+        assert!(res.is_err(), "verifier must reject wrong leaf");
+    }
+
+    #[test]
+    fn verify_merkle_path_rejects_wrong_root() {
+        let setup = Blake3Setup::new(8);
+        let (blocks, leaf, root, b) =
+            honest_merkle_path(setup.n_block_slots(), 0xB3_BAD0);
+        let mut ch = FsChallenger::new(b"b3-merkle-test");
+        let (proof, commitment) = setup.prove_merkle_path(&blocks, &b, &mut ch);
+        let mut bad_root = root;
+        bad_root[7] ^= 1 << 31;
+        let mut chv = FsChallenger::new(b"b3-merkle-test");
+        let res = setup.verify_merkle_path(
+            &commitment, &proof, &leaf, &bad_root, &b, &mut chv,
+        );
+        assert!(res.is_err(), "verifier must reject wrong root");
+    }
+
+    #[test]
+    fn verify_merkle_path_rejects_wrong_bit() {
+        let setup = Blake3Setup::new(8);
+        let (blocks, leaf, root, b) =
+            honest_merkle_path(setup.n_block_slots(), 0xB3_B175);
+        let mut ch = FsChallenger::new(b"b3-merkle-test");
+        let (proof, commitment) = setup.prove_merkle_path(&blocks, &b, &mut ch);
+        let mut bad_b = b.clone();
+        bad_b[1] = !bad_b[1];
+        let mut chv = FsChallenger::new(b"b3-merkle-test");
+        let res = setup.verify_merkle_path(
+            &commitment, &proof, &leaf, &root, &bad_b, &mut chv,
+        );
+        assert!(res.is_err(), "verifier must reject wrong bit vector");
     }
 }
