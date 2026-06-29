@@ -61,7 +61,18 @@ pub const CHILD_STRIDE: usize = MUX_DELTA_OFFSET + DIGEST_BITS;
 
 pub const FOUND_OUT_FINAL_POS: usize = CHILDREN_BASE + FANOUT * CHILD_STRIDE;
 pub const SELECTED_OUT_FINAL_BASE: usize = FOUND_OUT_FINAL_POS + 1;
-pub const USEFUL_BITS: usize = SELECTED_OUT_FINAL_BASE + DIGEST_BITS;
+// Content soundness: mask must be a prefix (contiguous 1s from bit 0),
+// key bits above mask width must be 0.
+const MASK_CHECK_BASE: usize = SELECTED_OUT_FINAL_BASE + DIGEST_BITS;
+const N_MASK_CHECKS: usize = KEY_BITS - 1; // 255
+const MASK_AND_BASE: usize = MASK_CHECK_BASE + N_MASK_CHECKS;
+const N_MASK_AND: usize = N_MASK_CHECKS; // 255 (1 linear + 254 mul)
+const KEY_CHECK_BASE: usize = MASK_AND_BASE + N_MASK_AND;
+const N_KEY_CHECKS: usize = KEY_BITS; // 256
+const KEY_AND_BASE: usize = KEY_CHECK_BASE + N_KEY_CHECKS;
+const N_KEY_AND: usize = N_KEY_CHECKS; // 256 (1 linear + 255 mul)
+const ALL_OK_POS: usize = KEY_AND_BASE + N_KEY_AND;
+pub const USEFUL_BITS: usize = ALL_OK_POS + 1;
 
 const ROUTE_MASK_POSITIONS: [usize; W_MAX] = [0, 1, 2, 3, 4];
 const TRANSCRIPT_LABEL: &[u8] = b"mhot-route-f32-v0";
@@ -224,14 +235,6 @@ pub fn build_matrices_f32() -> (SparseBinaryMatrix, SparseBinaryMatrix) {
         FOUND_OUT_FINAL_POS,
         found_in_expr(FANOUT),
     );
-    set_mul(
-        &mut a_rows,
-        &mut b_rows,
-        Z_CONST_POS,
-        vec![FOUND_OUT_FINAL_POS],
-        vec![Z_CONST_POS],
-    );
-
     for bit in 0..DIGEST_BITS {
         set_linear(
             &mut a_rows,
@@ -240,6 +243,67 @@ pub fn build_matrices_f32() -> (SparseBinaryMatrix, SparseBinaryMatrix) {
             selected_state_expr(FANOUT, bit),
         );
     }
+
+    // --- Content soundness: mask prefix + key validity ---
+
+    // Mask prefix: check[i] = NOT(mask[i]) AND mask[i+1] for i in 0..254
+    for i in 0..N_MASK_CHECKS {
+        set_mul(
+            &mut a_rows, &mut b_rows,
+            MASK_CHECK_BASE + i,
+            vec![mask_pos(i), Z_CONST_POS],
+            vec![mask_pos(i + 1)],
+        );
+    }
+
+    // AND-chain of NOT(check[i]): mask_ok = NOT(c0) AND NOT(c1) AND ...
+    // mask_and[0] = NOT(check[0]) — linear
+    set_linear(&mut a_rows, &mut b_rows,
+        MASK_AND_BASE, vec![MASK_CHECK_BASE, Z_CONST_POS]);
+    // mask_and[i] = mask_and[i-1] AND NOT(check[i])
+    for i in 1..N_MASK_AND {
+        set_mul(
+            &mut a_rows, &mut b_rows,
+            MASK_AND_BASE + i,
+            vec![MASK_AND_BASE + i - 1],
+            vec![MASK_CHECK_BASE + i, Z_CONST_POS],
+        );
+    }
+
+    // Key validity: check[i] = key[i] AND NOT(mask[i]) for i in 0..255
+    for i in 0..N_KEY_CHECKS {
+        set_mul(
+            &mut a_rows, &mut b_rows,
+            KEY_CHECK_BASE + i,
+            vec![KEY_BASE + i],
+            vec![mask_pos(i), Z_CONST_POS],
+        );
+    }
+
+    // AND-chain of NOT(check[i]): key_ok = NOT(c0) AND NOT(c1) AND ...
+    set_linear(&mut a_rows, &mut b_rows,
+        KEY_AND_BASE, vec![KEY_CHECK_BASE, Z_CONST_POS]);
+    for i in 1..N_KEY_AND {
+        set_mul(
+            &mut a_rows, &mut b_rows,
+            KEY_AND_BASE + i,
+            vec![KEY_AND_BASE + i - 1],
+            vec![KEY_CHECK_BASE + i, Z_CONST_POS],
+        );
+    }
+
+    // all_ok = mask_ok AND key_ok
+    let mask_ok_pos = MASK_AND_BASE + N_MASK_AND - 1;
+    let key_ok_pos = KEY_AND_BASE + N_KEY_AND - 1;
+    set_mul(&mut a_rows, &mut b_rows, ALL_OK_POS, vec![mask_ok_pos], vec![key_ok_pos]);
+
+    // Final assert: found AND all_ok = 1 (via const_pin at Z_CONST_POS)
+    set_mul(
+        &mut a_rows, &mut b_rows,
+        Z_CONST_POS,
+        vec![FOUND_OUT_FINAL_POS],
+        vec![ALL_OK_POS],
+    );
 
     let to_mat = |rows| SparseBinaryMatrix {
         num_rows: K,
@@ -292,7 +356,21 @@ pub struct RouteF32Setup {
     pub pcs_params: PcsParams,
 }
 
+static SETUP_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<usize, std::sync::Arc<RouteF32Setup>>>,
+> = std::sync::OnceLock::new();
+
 impl RouteF32Setup {
+    pub fn cached(n_instances: usize) -> std::sync::Arc<Self> {
+        let cache = SETUP_CACHE.get_or_init(|| std::sync::Mutex::new(Default::default()));
+        let setup_n = route_setup_n_instances(n_instances);
+        let mut map = cache.lock().unwrap();
+        std::sync::Arc::clone(
+            map.entry(setup_n)
+                .or_insert_with(|| std::sync::Arc::new(Self::new(n_instances))),
+        )
+    }
+
     pub fn new(n_instances: usize) -> Self {
         assert!(n_instances >= 1, "n_instances must be >= 1");
         let setup_n_instances = route_setup_n_instances(n_instances);
@@ -591,11 +669,61 @@ pub fn fill_block_witness_f32(
     }
 
     write_linear(FOUND_OUT_FINAL_POS, found, z_u64, a_u64, b_u64);
-    set_zab(Z_CONST_POS, true, found, true, z_u64, a_u64, b_u64);
 
     for (bit, value) in selected.iter().copied().enumerate() {
         write_linear(selected_out_final_pos(bit), value, z_u64, a_u64, b_u64);
     }
+
+    // --- Content soundness witness ---
+
+    // Mask prefix checks: check[i] = NOT(mask[i]) AND mask[i+1]
+    for i in 0..N_MASK_CHECKS {
+        let check = !mask[i] & mask[i + 1];
+        set_zab(MASK_CHECK_BASE + i, check, !mask[i], mask[i + 1], z_u64, a_u64, b_u64);
+    }
+
+    // AND-chain: mask_and[0] = NOT(check[0])
+    let mut mask_ok = {
+        let c0 = !mask[0] & mask[1];
+        let v = !c0;
+        write_linear(MASK_AND_BASE, v, z_u64, a_u64, b_u64);
+        v
+    };
+    for i in 1..N_MASK_AND {
+        let check = !mask[i] & mask[i + 1];
+        let not_check = !check;
+        let v = mask_ok & not_check;
+        set_zab(MASK_AND_BASE + i, v, mask_ok, not_check, z_u64, a_u64, b_u64);
+        mask_ok = v;
+    }
+
+    // Key validity checks: check[i] = key[i] AND NOT(mask[i])
+    for i in 0..N_KEY_CHECKS {
+        let check = key[i] & !mask[i];
+        set_zab(KEY_CHECK_BASE + i, check, key[i], !mask[i], z_u64, a_u64, b_u64);
+    }
+
+    // AND-chain: key_and[0] = NOT(check[0])
+    let mut key_ok = {
+        let c0 = key[0] & !mask[0];
+        let v = !c0;
+        write_linear(KEY_AND_BASE, v, z_u64, a_u64, b_u64);
+        v
+    };
+    for i in 1..N_KEY_AND {
+        let check = key[i] & !mask[i];
+        let not_check = !check;
+        let v = key_ok & not_check;
+        set_zab(KEY_AND_BASE + i, v, key_ok, not_check, z_u64, a_u64, b_u64);
+        key_ok = v;
+    }
+
+    // all_ok = mask_ok AND key_ok
+    let all_ok = mask_ok & key_ok;
+    set_zab(ALL_OK_POS, all_ok, mask_ok, key_ok, z_u64, a_u64, b_u64);
+
+    // Final assert: found AND all_ok = 1 (via const_pin)
+    set_zab(Z_CONST_POS, true, found, all_ok, z_u64, a_u64, b_u64);
 }
 
 fn prove_route_from_parts(

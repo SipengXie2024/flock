@@ -52,3 +52,4 @@ skills-lock.json
 
 # Autoresearch loop artifacts (results TSVs, verify scripts, raw bench logs)
 autoresearch/
+*.data

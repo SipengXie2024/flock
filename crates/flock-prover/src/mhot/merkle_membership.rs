@@ -7,6 +7,16 @@ use flock_core::pcs::Commitment;
 
 use super::native_witness::{MhotNodeWitness, mhot_node_to_sha256_merkle};
 
+#[derive(Debug)]
+pub enum MhotMembershipError {
+    NodeVerify(MerklePathVerifyError),
+    CrossNodeBinding {
+        parent_idx: usize,
+        parent_leaf: [u32; 8],
+        child_root: [u32; 8],
+    },
+}
+
 /// Proof for a single MHOT node's in-node binary Merkle path.
 pub struct NodeMerkleProof {
     pub proof: MerklePathProof,
@@ -56,7 +66,8 @@ pub fn verify_node_merkle<Ch: Challenger>(
     proof: &NodeMerkleProof,
     challenger: &mut Ch,
 ) -> Result<(), MerklePathVerifyError> {
-    let needed = 1usize << min_n_blocks_log(proof.n_real_compressions);
+    let n_real = proof.b_bits.len();
+    let needed = 1usize << min_n_blocks_log(n_real);
     let setup = Sha256HybridSetup::new(needed);
     let mut b_bits = proof.b_bits.clone();
     b_bits.resize(needed, false);
@@ -81,13 +92,35 @@ pub fn prove_path_merkle<Ch: Challenger>(
     nodes.iter().map(|n| prove_node_merkle(n, challenger)).collect()
 }
 
-/// Verify in-node Merkle paths for a sequence of MHOT nodes.
+/// Verify in-node Merkle paths for a sequence of MHOT nodes, including
+/// cross-node binding: node[i].leaf (selected child digest) must equal
+/// node[i+1].native_root (the child's content hash / in-node Merkle root).
+///
+/// Each node's in-node wiring is proven sound via shift-sumcheck (O(1) PD
+/// claim per node). Cross-node binding is a public-value equality check:
+/// the shift-sumcheck guarantees that `leaf` and `native_root` are the
+/// actual committed values, so verifier-side equality suffices.
 pub fn verify_path_merkle<Ch: Challenger>(
     proofs: &[NodeMerkleProof],
     challenger: &mut Ch,
-) -> Result<(), MerklePathVerifyError> {
+) -> Result<(), MhotMembershipError> {
     for p in proofs {
-        verify_node_merkle(p, challenger)?;
+        verify_node_merkle(p, challenger).map_err(MhotMembershipError::NodeVerify)?;
+    }
+    // Cross-node binding uses SNARK-authenticated values only.
+    // proofs[i].leaf is authenticated (SNARK public input).
+    // proofs[i+1].root is authenticated (SNARK public input).
+    // native_root is NOT used because it is not SNARK-authenticated.
+    for i in 0..proofs.len().saturating_sub(1) {
+        let parent_selected = proofs[i].leaf;
+        let child_root = proofs[i + 1].root;
+        if parent_selected != child_root {
+            return Err(MhotMembershipError::CrossNodeBinding {
+                parent_idx: i,
+                parent_leaf: parent_selected,
+                child_root,
+            });
+        }
     }
     Ok(())
 }

@@ -17,6 +17,7 @@ pub enum VerifyError {
     Lincheck(lincheck::VerifyError),
     PcsAb(pcs::VerifyError),
     PcsC(pcs::VerifyError),
+    Wiring(String),
 }
 
 /// Dedicated single-thread rayon pool that the verifier runs inside.

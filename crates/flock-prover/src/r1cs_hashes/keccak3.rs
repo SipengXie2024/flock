@@ -494,7 +494,21 @@ pub struct KeccakSetup {
     pub pcs_params: PcsParams,
 }
 
+static KECCAK_SETUP_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<usize, std::sync::Arc<KeccakSetup>>>,
+> = std::sync::OnceLock::new();
+
 impl KeccakSetup {
+    pub fn cached(n_keccaks: usize) -> std::sync::Arc<Self> {
+        let cache = KECCAK_SETUP_CACHE.get_or_init(|| std::sync::Mutex::new(Default::default()));
+        let key = min_n_blocks_log(n_keccaks);
+        let mut map = cache.lock().unwrap();
+        std::sync::Arc::clone(
+            map.entry(key)
+                .or_insert_with(|| std::sync::Arc::new(Self::new(n_keccaks))),
+        )
+    }
+
     pub fn new(n_keccaks: usize) -> Self {
         Self::with_log_inv_rate(n_keccaks, 1)
     }

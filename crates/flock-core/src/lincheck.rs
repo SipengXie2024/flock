@@ -504,7 +504,7 @@ impl LincheckCircuit for CompactCscCircuit {
 ///
 /// Total "elements" = `1 + (k_log − k_skip) + n_log`, which is the shape the
 /// zerocheck's extract_c output uses.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct QuirkyPoint {
     /// Univariate-skip challenge ∈ F₁₂₈. Binds all `k_skip` skip variables.
     pub z_skip: F128,

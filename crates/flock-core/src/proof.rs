@@ -33,7 +33,7 @@ pub struct R1csProofLigerito {
 }
 
 /// A claim of the form `ẑ(point) = value` for the witness `z`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ZClaim {
     pub point: QuirkyPoint,
     pub value: F128,
@@ -44,7 +44,7 @@ pub struct ZClaim {
 /// Both `point.x_outer` parts differ; both `point.z_skip` and
 /// `point.x_inner_rest` shapes match (one univariate-skip coord + multilinear
 /// inner-rest), so this is "two quirky-shaped openings of `z`."
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct R1csClaim {
     /// From lincheck: `ẑ(ab.point) = ab.value` — covers both `â` and `b̂` at
     /// the same point (their lincheck claims collapsed to a shared z-claim

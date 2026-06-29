@@ -150,6 +150,44 @@ impl MhotHashSchedule {
             wires,
         }
     }
+
+    pub fn atom_output_f128(&self, atom_id: usize) -> (usize, usize) {
+        let block = atom_id / 3;
+        let sub = atom_id % 3;
+        let base = block * 1024 + (2 * sub + 1) * 16;
+        (base, base + 1)
+    }
+
+    pub fn atom_input_f128(&self, atom_id: usize, child_slot: usize) -> (usize, usize) {
+        let block = atom_id / 3;
+        let sub = atom_id % 3;
+        let base = block * 1024 + 2 * sub * 16 + 2 * child_slot;
+        (base, base + 1)
+    }
+
+    pub fn endpoint_f128_with_offset(
+        &self,
+        ep: &WireEndpoint,
+        atom_offset: usize,
+    ) -> Option<(usize, usize)> {
+        match *ep {
+            WireEndpoint::AtomOutput { atom_id } => {
+                let global = atom_id + atom_offset;
+                let block = global / 3;
+                let sub = global % 3;
+                let base = block * 1024 + (2 * sub + 1) * 16;
+                Some((base, base + 1))
+            }
+            WireEndpoint::AtomInput { atom_id, child_slot } => {
+                let global = atom_id + atom_offset;
+                let block = global / 3;
+                let sub = global % 3;
+                let base = block * 1024 + 2 * sub * 16 + 2 * child_slot;
+                Some((base, base + 1))
+            }
+            WireEndpoint::PublicRoot | WireEndpoint::LeafDigest { .. } => None,
+        }
+    }
 }
 
 fn atom_count_for_fanout(fanout: usize) -> usize {
