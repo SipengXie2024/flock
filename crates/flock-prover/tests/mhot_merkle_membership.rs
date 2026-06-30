@@ -235,7 +235,7 @@ fn cross_node_binding_mismatch_fails() {
     }
 }
 
-// --- route↔hash binding (Task 1): prove_membership / verify_membership ---
+// --- prove_membership / verify_membership ---
 
 fn synthetic_content(nc: usize) -> ContentMeta {
     ContentMeta {
@@ -352,5 +352,20 @@ fn membership_wrong_root_fails() {
     match verify_membership(&proof, &root, &mut chv) {
         Err(MhotMembershipError::RootMismatch { .. }) => {}
         other => panic!("wrong root must fail, got {other:?}"),
+    }
+}
+
+#[test]
+fn membership_tampered_content_hash_fails() {
+    let inputs = linked_inputs(&[8, 4, 2]);
+    let mut ch = FsChallenger::new(b"mhot-membership-ch");
+    let mut proof = prove_membership(&inputs, &mut ch);
+    let root = proof.content_proofs[0].content_hash;
+    proof.content_proofs[1].content_hash[0] ^= 1;
+    let mut chv = FsChallenger::new(b"mhot-membership-ch");
+    match verify_membership(&proof, &root, &mut chv) {
+        Err(MhotMembershipError::ContentHashMismatch { .. }) => {}
+        Err(MhotMembershipError::CrossNodeBinding { .. }) => {}
+        other => panic!("tampered content_hash must be rejected, got {other:?}"),
     }
 }

@@ -10,7 +10,6 @@ use flock_core::pcs::{
     self, BatchOpeningProofLigerito, Commitment, DirectEqInd, PackedDirectClaim,
     PackedDirectClaimRef,
 };
-use flock_core::proof::R1csClaim;
 use flock_core::verifier::VerifyError;
 use flock_core::zerocheck::ZerocheckProof;
 
@@ -29,6 +28,7 @@ pub enum MhotMembershipError {
     RouteVerify(VerifyError),
     RouteOpening(VerifyError),
     ContentChainVerify(usize, ChainVerifyError),
+    ContentHashMismatch { node_idx: usize },
     RootMismatch {
         expected: [u32; 8],
         actual: [u32; 8],
@@ -175,8 +175,8 @@ fn pad_to_needed(
 }
 
 // ---------------------------------------------------------------------------
-// Content hash chain (Task 2): SHA-256(masks ‖ partial_keys ‖ merkle_root ‖ counts)
-// proved as a sequential SHA-256 chain via chain_common.
+// Content hash chain: SHA-256(masks ‖ keys ‖ merkle_root ‖ counts) proved as
+// a sequential chain via chain_common. Authenticates node identity.
 // ---------------------------------------------------------------------------
 
 use crate::r1cs_hashes::sha2::ChainVerifyError;
@@ -192,12 +192,11 @@ pub struct ContentMeta {
 
 /// Build the SHA-256 Merkle-Damgard chain for content_hash.
 ///
-/// Returns `(compressions, content_hash)` where compressions are padded to
-/// a power of 2 ≥ 8 for Flock's chain protocol.
+/// Returns `(compressions, content_hash, cv_last, n_real)`.
 pub fn build_content_hash_chain(
     meta: &ContentMeta,
     merkle_root: &[u8; 32],
-) -> (Vec<Compression>, [u32; 8]) {
+) -> (Vec<Compression>, [u32; 8], [u32; 8], usize) {
     let mut data = Vec::new();
     for &mask in &meta.extraction_masks {
         data.extend_from_slice(&mask.to_le_bytes());
@@ -241,13 +240,13 @@ pub fn build_content_hash_chain(
         cv = sha256_compress(&cv, &m);
     }
 
-    (compressions, content_hash)
+    (compressions, content_hash, cv, n_real)
 }
 
 /// Compute content_hash natively (for verifier-side checks). Matches
 /// `mhot-verify/src/proof.rs::compute_node_content_hash`.
 pub fn compute_content_hash(meta: &ContentMeta, merkle_root: &[u8; 32]) -> [u8; 32] {
-    let (_, cv) = build_content_hash_chain(meta, merkle_root);
+    let (_, cv, _, _) = build_content_hash_chain(meta, merkle_root);
     let mut out = [0u8; 32];
     for i in 0..8 {
         out[4 * i..4 * i + 4].copy_from_slice(&cv[i].to_be_bytes());
@@ -256,11 +255,8 @@ pub fn compute_content_hash(meta: &ContentMeta, merkle_root: &[u8; 32]) -> [u8; 
 }
 
 // ---------------------------------------------------------------------------
-// Route↔hash binding (Task 1): one membership proof tying the route R1CS
-// (PEXT matching + content soundness) to the in-node SHA-256 Merkle proof.
-// Two independent commitments (hash + route) are bound by opening the route
-// commitment's SELECTED_OUT_FINAL (the routed-child digest) via PackedDirect-
-// Claims and asserting it equals the hash side's authenticated leaf.
+// Route↔hash binding: PackedDirectClaims open the route commitment's
+// SELECTED_OUT_FINAL and assert it equals the hash side's authenticated leaf.
 // ---------------------------------------------------------------------------
 
 /// Within-block packed index of SELECTED_OUT_FINAL's first F128. It is
@@ -299,6 +295,7 @@ pub struct ContentChainProof {
     pub content_hash: [u32; 8],
     pub cv_last: [u32; 8],
     pub n_compressions: usize,
+    pub n_real_compressions: usize,
 }
 
 /// A sound membership proof for one MHOT path: per-node SHA-256 Merkle path
@@ -311,7 +308,6 @@ pub struct MhotMembershipProof {
     pub route_lc: LincheckProof,
     pub route_pcs: BatchOpeningProofLigerito,
     pub route_commitment: Commitment,
-    pub route_claim: R1csClaim,
     pub n_routes: usize,
 }
 
@@ -354,6 +350,7 @@ fn leaf_words_to_digest_bytes(leaf: &[u32; 8]) -> [u8; 32] {
 
 /// Pack up to 128 bools into one F128 (lo = bits 0..64, hi = bits 64..128).
 fn pack_bits_to_f128(bits: &[bool]) -> F128 {
+    assert!(bits.len() <= 128, "pack_bits_to_f128: slice length {} > 128", bits.len());
     let mut lo = 0u64;
     let mut hi = 0u64;
     for (k, &b) in bits.iter().enumerate() {
@@ -432,16 +429,17 @@ pub fn prove_membership(
         .enumerate()
         .map(|(idx, (input, hp))| {
             let merkle_root_bytes = leaf_words_to_digest_bytes(&hp.native_root);
-            let (compressions, content_hash) =
+            let (compressions, content_hash, cv_last, n_real) =
                 build_content_hash_chain(&input.content, &merkle_root_bytes);
             let n = compressions.len();
-            let last = &compressions[n - 1];
-            let cv_last = sha256_compress(&last.0, &last.1);
             let setup = Sha256HybridSetup::new(n);
             let mut chain_ch = fork_content_challenger(challenger, idx);
             let (proof, commitment) = setup.prove_chain(&compressions, &mut chain_ch);
             challenger.observe_bytes(&commitment.root);
-            ContentChainProof { proof, commitment, content_hash, cv_last, n_compressions: n }
+            ContentChainProof {
+                proof, commitment, content_hash, cv_last,
+                n_compressions: n, n_real_compressions: n_real,
+            }
         })
         .collect();
 
@@ -493,7 +491,6 @@ pub fn prove_membership(
         route_lc: route_open.lc_proof,
         route_pcs: route_open.pcs_open,
         route_commitment: route_open.commitment,
-        route_claim: route_open.claim,
         n_routes,
     }
 }
@@ -517,6 +514,9 @@ pub fn verify_membership(
     }
 
     // ---- Content hash chain: verify each node's chain (forked challenger).
+    // After chain verify (which authenticates cv_last), check that applying
+    // the deterministic padding from content_hash reproduces cv_last. This
+    // authenticates content_hash via SHA-256 collision resistance.
     for (i, cp) in proof.content_proofs.iter().enumerate() {
         let setup = Sha256HybridSetup::new(cp.n_compressions);
         let mut chain_ch = fork_content_challenger(challenger, i);
@@ -524,6 +524,15 @@ pub fn verify_membership(
             .verify_chain(&cp.commitment, &cp.proof, &SHA256_IV, &cp.cv_last, &mut chain_ch)
             .map_err(|e| MhotMembershipError::ContentChainVerify(i, e))?;
         challenger.observe_bytes(&cp.commitment.root);
+
+        let n_pad = cp.n_compressions.saturating_sub(cp.n_real_compressions);
+        let mut expected_cv = cp.content_hash;
+        for _ in 0..n_pad {
+            expected_cv = sha256_compress(&expected_cv, &[0u32; 16]);
+        }
+        if expected_cv != cp.cv_last {
+            return Err(MhotMembershipError::ContentHashMismatch { node_idx: i });
+        }
     }
 
     // Cross-node binding: parent's hash leaf == child's content_hash.
