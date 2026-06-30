@@ -2,17 +2,10 @@ use std::time::Instant;
 
 use flock_core::challenger::FsChallenger;
 use flock_prover::mhot::{
-    merkle_membership::{
-        compute_content_hash, MhotMembershipInput, ContentMeta,
-    },
-    multiproof::{prove_mhot_multiproof, verify_mhot_multiproof, MhotPathInput},
+    merkle_membership::{compute_content_hash, ContentMeta, MhotMembershipInput},
     native_witness::MhotNodeWitness,
-    ref_witness::build_ref_witness,
-    route_f32::{self as route, RouteF32Witness},
-    schedule::MhotHashSchedule,
     sound_multiproof::{prove_sound_multiproof, verify_sound_multiproof},
 };
-use flock_prover::r1cs_hashes::sha2::sha256_compress;
 
 fn synthetic_content(nc: usize) -> ContentMeta {
     ContentMeta {
@@ -78,29 +71,6 @@ fn linked_inputs(fanouts: &[usize]) -> Vec<MhotMembershipInput> {
     inputs_rev
 }
 
-fn make_multiproof_input(fanouts: &[usize], seed: u64) -> MhotPathInput {
-    let sched = MhotHashSchedule::from_fanouts(fanouts);
-    let hash_witness = build_ref_witness(&sched, seed);
-    let route_witnesses: Vec<RouteF32Witness> = sched
-        .fanouts
-        .iter()
-        .enumerate()
-        .map(|(node, &fanout)| {
-            let mut key = [false; route::KEY_BITS];
-            let mut mask = [false; route::KEY_BITS];
-            key[0] = (node & 1) != 0;
-            key[1] = true;
-            mask[0] = true;
-            mask[1] = true;
-            let children: Vec<[bool; route::DIGEST_BITS]> = (0..fanout.min(route::FANOUT))
-                .map(|c| std::array::from_fn(|b| ((node * 31 + c * 17 + b) & 1) != 0))
-                .collect();
-            RouteF32Witness::new_padded(key, mask, &children, fanout.min(route::FANOUT))
-        })
-        .collect();
-    MhotPathInput { schedule: sched, hash_witness, route_witnesses }
-}
-
 #[test]
 fn sound_membership_benchmark() {
     let fanouts = &[8, 4, 2];
@@ -130,28 +100,5 @@ fn sound_membership_benchmark() {
         let unique = proof.hash_proofs.len();
         eprintln!("{:>8} {:>12.1} {:>12.1} {:>12.1} {:>11.3} {:>10}",
             n_paths, prove_ms, verify_ms, total, total / n_paths as f64, unique);
-    }
-
-    eprintln!();
-    eprintln!("=== Flock Multiproof (benchmark tool, not sound) ===");
-    eprintln!("{:>8} {:>12} {:>12} {:>12} {:>12}",
-        "n_paths", "prove_ms", "verify_ms", "total_ms", "per_path");
-    eprintln!("{}", "-".repeat(60));
-
-    for &n_paths in &[1, 4, 16, 256, 4096, 16384] {
-        let paths: Vec<MhotPathInput> =
-            (0..n_paths).map(|_| make_multiproof_input(fanouts, 42)).collect();
-
-        let t0 = Instant::now();
-        let proof = prove_mhot_multiproof(&paths);
-        let prove_ms = t0.elapsed().as_secs_f64() * 1e3;
-
-        let t1 = Instant::now();
-        verify_mhot_multiproof(&proof).expect("must verify");
-        let verify_ms = t1.elapsed().as_secs_f64() * 1e3;
-
-        let total = prove_ms + verify_ms;
-        eprintln!("{:>8} {:>12.1} {:>12.1} {:>12.1} {:>11.3}",
-            n_paths, prove_ms, verify_ms, total, total / n_paths as f64);
     }
 }
