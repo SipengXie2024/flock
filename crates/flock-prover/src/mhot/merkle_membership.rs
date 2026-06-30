@@ -66,7 +66,7 @@ pub fn prove_node_merkle<Ch: Challenger>(
     let needed = 1usize << min_n_blocks_log(n_real);
     let padded_root = pad_to_needed(&mut compressions, &mut b_bits, needed);
 
-    let setup = Sha256HybridSetup::new(needed);
+    let setup = Sha256HybridSetup::cached(needed);
     let (proof, commitment) = setup.prove_merkle_path(&compressions, &b_bits, challenger);
     NodeMerkleProof {
         proof,
@@ -86,7 +86,7 @@ pub fn verify_node_merkle<Ch: Challenger>(
 ) -> Result<(), MerklePathVerifyError> {
     let n_real = proof.b_bits.len();
     let needed = 1usize << min_n_blocks_log(n_real);
-    let setup = Sha256HybridSetup::new(needed);
+    let setup = Sha256HybridSetup::cached(needed);
     let mut b_bits = proof.b_bits.clone();
     b_bits.resize(needed, false);
     setup.verify_merkle_path(
@@ -432,7 +432,7 @@ pub fn prove_membership(
             let (compressions, content_hash, cv_last, n_real) =
                 build_content_hash_chain(&input.content, &merkle_root_bytes);
             let n = compressions.len();
-            let setup = Sha256HybridSetup::new(n);
+            let setup = Sha256HybridSetup::cached(n);
             let mut chain_ch = fork_content_challenger(challenger, idx);
             let (proof, commitment) = setup.prove_chain(&compressions, &mut chain_ch);
             challenger.observe_bytes(&commitment.root);
@@ -518,7 +518,7 @@ pub fn verify_membership(
     // the deterministic padding from content_hash reproduces cv_last. This
     // authenticates content_hash via SHA-256 collision resistance.
     for (i, cp) in proof.content_proofs.iter().enumerate() {
-        let setup = Sha256HybridSetup::new(cp.n_compressions);
+        let setup = Sha256HybridSetup::cached(cp.n_compressions);
         let mut chain_ch = fork_content_challenger(challenger, i);
         setup
             .verify_chain(&cp.commitment, &cp.proof, &SHA256_IV, &cp.cv_last, &mut chain_ch)

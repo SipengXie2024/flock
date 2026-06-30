@@ -1248,7 +1248,22 @@ pub struct Sha256HybridSetup {
     pub pcs_params: flock_core::pcs::PcsParams,
 }
 
+static SHA256_SETUP_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<usize, std::sync::Arc<Sha256HybridSetup>>>,
+> = std::sync::OnceLock::new();
+
 impl Sha256HybridSetup {
+    pub fn cached(n_compressions: usize) -> std::sync::Arc<Self> {
+        let cache =
+            SHA256_SETUP_CACHE.get_or_init(|| std::sync::Mutex::new(Default::default()));
+        let key = min_n_blocks_log(n_compressions);
+        let mut map = cache.lock().unwrap();
+        std::sync::Arc::clone(
+            map.entry(key)
+                .or_insert_with(|| std::sync::Arc::new(Self::new(n_compressions))),
+        )
+    }
+
     pub fn new(n_compressions: usize) -> Self {
         Self::with_log_inv_rate(n_compressions, 1)
     }
