@@ -220,9 +220,7 @@ pub fn build_content_hash_chain(
     assert_eq!(data.len() % 64, 0);
 
     let n_real = data.len() / 64;
-    let min_m = 22;
-    let min_n = 1usize << (min_m - 15); // K_LOG=15; minimum Ligerito config
-    let n_padded = n_real.max(min_n).next_power_of_two();
+    let n_padded = n_real.max(8).next_power_of_two();
 
     let mut compressions = Vec::with_capacity(n_padded);
     let mut cv = SHA256_IV;
@@ -431,15 +429,23 @@ pub fn prove_membership(
         .enumerate()
         .map(|(idx, (input, hp))| {
             let merkle_root_bytes = leaf_words_to_digest_bytes(&hp.native_root);
-            let (compressions, content_hash, cv_last, n_real) =
+            let (mut compressions, content_hash, cv_last, n_real) =
                 build_content_hash_chain(&input.content, &merkle_root_bytes);
-            let n = compressions.len();
+            let min_standalone = 1usize << (22 - crate::r1cs_hashes::sha2::K_LOG);
+            let n = compressions.len().max(min_standalone).next_power_of_two();
+            let mut cv = cv_last;
+            while compressions.len() < n {
+                let m = [0u32; 16];
+                compressions.push((cv, m));
+                cv = sha256_compress(&cv, &m);
+            }
+            let cv_last_extended = cv;
             let setup = Sha256HybridSetup::cached(n);
             let mut chain_ch = fork_content_challenger(challenger, idx);
             let (proof, commitment) = setup.prove_chain(&compressions, &mut chain_ch);
             challenger.observe_bytes(&commitment.root);
             ContentChainProof {
-                proof, commitment, content_hash, cv_last,
+                proof, commitment, content_hash, cv_last: cv_last_extended,
                 n_compressions: n, n_real_compressions: n_real,
             }
         })

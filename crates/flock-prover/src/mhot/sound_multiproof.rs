@@ -1,5 +1,14 @@
 use std::collections::HashMap;
 
+fn vmrss_mb() -> f64 {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| s.lines().find(|l| l.starts_with("VmRSS:"))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|v| v.parse::<f64>().ok()))
+        .unwrap_or(0.0) / 1024.0
+}
+
 use crate::chain::{ChainShiftProof, prove_chain_shift, verify_chain_shift};
 use crate::merkle_path::{MerklePathShiftProof, prove_merkle_path_shift, verify_merkle_path_shift};
 use crate::prover::{prove_fast_core_with_block_count, quirky_x_outer_full};
@@ -150,6 +159,7 @@ pub fn prove_sound_multiproof(
     }
 
     let u = unique_nodes.len();
+    eprintln!("[mem] after dedup ({} unique): {:.0} MB", u, vmrss_mb());
 
     // -- Per-node: compute merkle + chain compressions and block counts --
     let mut merkle_data: Vec<(Vec<Compression>, Vec<bool>, [u32; 8], [u32; 8], [u32; 8])> =
@@ -200,8 +210,10 @@ pub fn prove_sound_multiproof(
         alloc.block_offset = cursor;
         cursor += alloc.block_count;
     }
-    let n_total_blocks = cursor.next_power_of_two();
+    let min_n_total = 1usize << (22 - crate::r1cs_hashes::sha2::K_LOG);
+    let n_total_blocks = cursor.max(min_n_total).next_power_of_two();
     let n_log_total = n_total_blocks.trailing_zeros() as usize;
+    eprintln!("[mem] after block alloc (n_log_total={}, {} total blocks): {:.0} MB", n_log_total, n_total_blocks, vmrss_mb());
 
     let mut merkle_block_offsets = vec![0usize; u];
     let mut chain_block_offsets = vec![0usize; u];
@@ -228,6 +240,7 @@ pub fn prove_sound_multiproof(
     // -- Generate witness and prove core --
     let (z_packed, a_packed, b_packed, z_lincheck) =
         generate_witness_with_ab_packed_and_lincheck(&all_comps, n_log_total);
+    eprintln!("[mem] after generate_witness: {:.0} MB", vmrss_mb());
 
     let setup = Sha256HybridSetup::cached(n_total_blocks);
     let sha256_core = prove_fast_core_with_block_count(
@@ -241,6 +254,7 @@ pub fn prove_sound_multiproof(
         None,
         challenger,
     );
+    eprintln!("[mem] after prove_fast_core: {:.0} MB", vmrss_mb());
 
     // -- Sample merkle tau_pos and run per-node merkle shifts --
     let merkle_tau_pos = challenger.sample_f128_vec(MERKLE_LAYOUT.tau_pos_len());
@@ -311,6 +325,8 @@ pub fn prove_sound_multiproof(
         chain_pd_claims.push(pd);
     }
 
+    eprintln!("[mem] after shift-sumchecks: {:.0} MB", vmrss_mb());
+
     // -- Route base (unchanged from original) --
     let route_witnesses: Vec<route::RouteF32Witness> =
         unique_nodes.iter().map(|input| input.route_witness.clone()).collect();
@@ -356,6 +372,7 @@ pub fn prove_sound_multiproof(
         &all_sha_pd,
         &mut sha_pcs_challenger,
     );
+    eprintln!("[mem] after sha256 PCS open: {:.0} MB", vmrss_mb());
 
     // -- Route PCS open --
     let route_open = open_core_ligerito(
@@ -366,6 +383,7 @@ pub fn prove_sound_multiproof(
         &route_pd_claims,
         &mut route_pcs_challenger,
     );
+    eprintln!("[mem] after route proof: {:.0} MB", vmrss_mb());
 
     SoundMultiproof {
         sha256_zc: sha_open.zc_proof,
