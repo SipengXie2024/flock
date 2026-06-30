@@ -413,15 +413,15 @@ fn verify_mhot_multiproof_inner(proof: &MhotMultiproof, timed: bool) -> Result<(
     Ok(())
 }
 
-struct OpenedCore {
-    zc_proof: ZerocheckProof,
-    lc_proof: LincheckProof,
-    pcs_open: BatchOpeningProofLigerito,
-    commitment: Commitment,
-    claim: R1csClaim,
+pub(crate) struct OpenedCore {
+    pub(crate) zc_proof: ZerocheckProof,
+    pub(crate) lc_proof: LincheckProof,
+    pub(crate) pcs_open: BatchOpeningProofLigerito,
+    pub(crate) commitment: Commitment,
+    pub(crate) claim: R1csClaim,
 }
 
-fn open_core_ligerito(
+pub(crate) fn open_core_ligerito(
     r1cs: &BlockR1cs,
     pcs_params: &PcsParams,
     core: ProveCore,
@@ -475,7 +475,7 @@ fn open_core_ligerito(
     }
 }
 
-fn verify_core_opening_ligerito(
+pub(crate) fn verify_core_opening_ligerito(
     r1cs: &BlockR1cs,
     pcs_params: &PcsParams,
     commitment: &Commitment,

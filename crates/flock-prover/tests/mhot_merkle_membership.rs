@@ -1,8 +1,9 @@
 use flock_core::challenger::FsChallenger;
 use flock_prover::mhot::{
     merkle_membership::{
-        prove_node_merkle, verify_node_merkle, prove_path_merkle, verify_path_merkle,
-        MhotMembershipError,
+        mhot_node_to_route_witness, prove_membership, prove_node_merkle, prove_path_merkle,
+        verify_membership, verify_node_merkle, verify_path_merkle, MhotMembershipError,
+        MhotMembershipInput,
     },
     native_witness::{MhotNodeWitness, mhot_node_to_sha256_merkle},
 };
@@ -230,5 +231,76 @@ fn cross_node_binding_mismatch_fails() {
     match verify_path_merkle(&proofs, &mut ch2) {
         Err(MhotMembershipError::CrossNodeBinding { .. }) => {}
         other => panic!("expected CrossNodeBinding error, got {other:?}"),
+    }
+}
+
+// --- route↔hash binding (Task 1): prove_membership / verify_membership ---
+
+fn linked_inputs(fanouts: &[usize]) -> Vec<MhotMembershipInput> {
+    build_linked_path(fanouts)
+        .into_iter()
+        .map(MhotMembershipInput::from_node)
+        .collect()
+}
+
+#[test]
+fn membership_single_path_roundtrip() {
+    let inputs = linked_inputs(&[8, 4, 2]);
+    let mut ch = FsChallenger::new(b"mhot-membership");
+    let proof = prove_membership(&inputs, &mut ch);
+    let root = proof.hash_proofs[0].root;
+    let mut chv = FsChallenger::new(b"mhot-membership");
+    verify_membership(&proof, &root, &mut chv).expect("honest membership must verify");
+}
+
+#[test]
+fn membership_tampered_route_commitment_fails() {
+    let inputs = linked_inputs(&[8, 4, 2]);
+    let mut ch = FsChallenger::new(b"mhot-membership-tc");
+    let mut proof = prove_membership(&inputs, &mut ch);
+    let root = proof.hash_proofs[0].root;
+    proof.route_commitment.root[0] ^= 1;
+    let mut chv = FsChallenger::new(b"mhot-membership-tc");
+    verify_membership(&proof, &root, &mut chv)
+        .expect_err("tampered route commitment must fail");
+}
+
+#[test]
+fn membership_wrong_route_fails() {
+    // Hash side selects child A (leaf = children[A]); route is rewired to route
+    // to a different child B, so route SELECTED_OUT_FINAL = children[B] != leaf.
+    // The PackedDirectClaim binding must reject this.
+    let nodes = build_linked_path(&[8, 4, 2]);
+    let mut inputs: Vec<MhotMembershipInput> =
+        nodes.iter().cloned().map(MhotMembershipInput::from_node).collect();
+    let node0 = &nodes[0];
+    let wrong_sel = (node0.selected_child + 1) % node0.children.len();
+    let wrong_node = MhotNodeWitness {
+        children: node0.children.clone(),
+        selected_child: wrong_sel,
+    };
+    inputs[0].route_witness = mhot_node_to_route_witness(&wrong_node);
+
+    let mut ch = FsChallenger::new(b"mhot-membership-wr");
+    let proof = prove_membership(&inputs, &mut ch);
+    let root = proof.hash_proofs[0].root;
+    let mut chv = FsChallenger::new(b"mhot-membership-wr");
+    match verify_membership(&proof, &root, &mut chv) {
+        Err(MhotMembershipError::RouteOpening(_)) => {}
+        other => panic!("route-to-wrong-child must fail binding, got {other:?}"),
+    }
+}
+
+#[test]
+fn membership_wrong_root_fails() {
+    let inputs = linked_inputs(&[8, 4, 2]);
+    let mut ch = FsChallenger::new(b"mhot-membership-rt");
+    let proof = prove_membership(&inputs, &mut ch);
+    let mut root = proof.hash_proofs[0].root;
+    root[0] ^= 1;
+    let mut chv = FsChallenger::new(b"mhot-membership-rt");
+    match verify_membership(&proof, &root, &mut chv) {
+        Err(MhotMembershipError::RootMismatch { .. }) => {}
+        other => panic!("wrong root must fail, got {other:?}"),
     }
 }

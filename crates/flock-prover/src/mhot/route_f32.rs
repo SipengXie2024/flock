@@ -60,10 +60,10 @@ pub const MUX_DELTA_OFFSET: usize = FOUND_STATE_OFFSET + 1;
 pub const CHILD_STRIDE: usize = MUX_DELTA_OFFSET + DIGEST_BITS;
 
 pub const FOUND_OUT_FINAL_POS: usize = CHILDREN_BASE + FANOUT * CHILD_STRIDE;
-pub const SELECTED_OUT_FINAL_BASE: usize = FOUND_OUT_FINAL_POS + 1;
 // Content soundness: mask must be a prefix (contiguous 1s from bit 0),
-// key bits above mask width must be 0.
-const MASK_CHECK_BASE: usize = SELECTED_OUT_FINAL_BASE + DIGEST_BITS;
+// key bits above mask width must be 0. Placed right after the found flag so
+// the routed-child digest output can go last at an aligned offset.
+const MASK_CHECK_BASE: usize = FOUND_OUT_FINAL_POS + 1;
 const N_MASK_CHECKS: usize = KEY_BITS - 1; // 255
 const MASK_AND_BASE: usize = MASK_CHECK_BASE + N_MASK_CHECKS;
 const N_MASK_AND: usize = N_MASK_CHECKS; // 255 (1 linear + 254 mul)
@@ -72,7 +72,12 @@ const N_KEY_CHECKS: usize = KEY_BITS; // 256
 const KEY_AND_BASE: usize = KEY_CHECK_BASE + N_KEY_CHECKS;
 const N_KEY_AND: usize = N_KEY_CHECKS; // 256 (1 linear + 255 mul)
 const ALL_OK_POS: usize = KEY_AND_BASE + N_KEY_AND;
-pub const USEFUL_BITS: usize = ALL_OK_POS + 1;
+// SELECTED_OUT_FINAL (256-bit routed-child digest) sits at a DIGEST_BITS-aligned
+// offset so one PackedDirectClaim extracts it as a single aligned slot for the
+// route↔hash binding in merkle_membership.rs.
+pub const SELECTED_OUT_FINAL_BASE: usize =
+    ((ALL_OK_POS + 1 + DIGEST_BITS - 1) / DIGEST_BITS) * DIGEST_BITS;
+pub const USEFUL_BITS: usize = SELECTED_OUT_FINAL_BASE + DIGEST_BITS;
 
 const ROUTE_MASK_POSITIONS: [usize; W_MAX] = [0, 1, 2, 3, 4];
 const TRANSCRIPT_LABEL: &[u8] = b"mhot-route-f32-v0";
@@ -899,8 +904,13 @@ mod tests {
         assert_eq!(CHILD_STRIDE, 523);
         assert_eq!(FOUND_OUT_FINAL_POS, 769 + 32 * 523);
         assert_eq!(FOUND_OUT_FINAL_POS, 17505);
-        assert_eq!(SELECTED_OUT_FINAL_BASE, 17506);
-        assert_eq!(USEFUL_BITS, 17762);
+        assert_eq!(SELECTED_OUT_FINAL_BASE, 18688);
+        assert_eq!(
+            SELECTED_OUT_FINAL_BASE % DIGEST_BITS,
+            0,
+            "SELECTED_OUT_FINAL must be 256-bit aligned for PD-claim binding"
+        );
+        assert_eq!(USEFUL_BITS, 18944);
         assert!(USEFUL_BITS <= K, "USEFUL_BITS {USEFUL_BITS} > K {K}");
 
         let (a_0, b_0) = build_matrices_f32();
