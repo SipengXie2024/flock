@@ -20,6 +20,7 @@ use super::route_f32::{self as route, RouteF32Setup, RouteF32Witness};
 #[derive(Debug)]
 pub enum MhotMembershipError {
     NodeVerify(MerklePathVerifyError),
+    NodeVerify2(VerifyError),
     CrossNodeBinding {
         parent_idx: usize,
         parent_leaf: [u32; 8],
@@ -146,7 +147,7 @@ pub fn verify_path_merkle<Ch: Challenger>(
 
 /// Pad compressions and b_bits to `needed` slots with dummy identity
 /// compressions that extend the Merkle chain. Returns the final chain root.
-fn pad_to_needed(
+pub(crate) fn pad_to_needed(
     compressions: &mut Vec<Compression>,
     b_bits: &mut Vec<bool>,
     needed: usize,

@@ -201,6 +201,49 @@ pub fn fold_all_slots(
     results
 }
 
+/// Range variant of [`fold_all_slots`]: folds only a contiguous sub-range of
+/// blocks within a larger packed witness buffer. Used by the pooled-commitment
+/// path where multiple node types share one `z_packed`.
+///
+/// * `block_offset` — first block index (0-based) within `packed` belonging to
+///   this node type.
+/// * `block_count` — number of blocks in this node type's range.
+pub fn fold_all_slots_range(
+    layout: &MerkleLayout,
+    packed: &[F128],
+    fold: &MerklePathFold,
+    block_offset: usize,
+    block_count: usize,
+) -> [Vec<F128>; 4] {
+    use rayon::prelude::*;
+
+    let bits_per_packed = 1usize << LOG_PACKING;
+    let n_packed_per_slot = 1usize << fold.tau_pos.len();
+    let block_packed = (1usize << layout.k_log) / bits_per_packed;
+    let slot_base_packed = (layout.slot_base_byte_off * 8) / bits_per_packed;
+    let n_inst = block_count;
+
+    let eq_tau = build_eq_table(&fold.tau_pos);
+
+    let fold_one = |base: usize| -> F128 {
+        let mut acc = F128::ZERO;
+        for pos in 0..n_packed_per_slot {
+            acc += eq_tau[pos] * packed[base + pos];
+        }
+        acc
+    };
+
+    let mut results: [Vec<F128>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+    for (slot_idx, vec_out) in results.iter_mut().enumerate() {
+        let slot_offset = slot_base_packed + slot_idx * n_packed_per_slot;
+        *vec_out = (0..n_inst)
+            .into_par_iter()
+            .map(|i| fold_one((block_offset + i) * block_packed + slot_offset))
+            .collect();
+    }
+    results
+}
+
 // ---------------------------------------------------------------------------
 // Packed-direct claim assembly
 // ---------------------------------------------------------------------------
@@ -239,6 +282,77 @@ pub fn assemble_merkle_path_claim(
     }
 }
 
+/// Assemble a packed-direct merkle claim that refers to a sub-range of a
+/// larger pooled polynomial. The point layout extends the per-commitment
+/// variant with offset bits that locate this node's block range:
+/// ```text
+///   [tau_pos ..., sel_slot, side, 0..0, instance_point ..., offset_bits ...]
+///     ^^^^^      ^^^^^^^^^^^^^^^  ^^^^   ^^^^^^^^^^^^^^      ^^^^^^^^^^^^^
+///     fold       slot selectors   high   sumcheck output     LSB-first binary
+///     coords     (sel_slot, side) zeros  (log2(block_count)  of block_offset /
+///                                        coords from the     block_count
+///                                        per-node shift)     (n_log_total -
+///                                                            log2(block_count)
+///                                                            coords)
+/// ```
+/// Total point length = `tau_pos.len() + 2 + high_zeros + n_log_total`.
+pub fn assemble_merkle_path_claim_at_offset(
+    layout: &MerkleLayout,
+    fold: &MerklePathFold,
+    claims: &crate::merkle_path::MerklePathClaims,
+    block_offset: usize,
+    block_count: usize,
+    n_log_total: usize,
+) -> PackedDirectClaim {
+    let inst_log = claims.instance_point.len();
+    assert_eq!(
+        inst_log,
+        block_count.trailing_zeros() as usize,
+        "instance_point length must equal log2(block_count)"
+    );
+    assert!(
+        n_log_total >= inst_log,
+        "n_log_total must be >= log2(block_count)"
+    );
+    let offset_len = n_log_total - inst_log;
+    let offset_index = block_offset / block_count;
+    assert_eq!(
+        block_offset % block_count,
+        0,
+        "block_offset must be aligned to block_count"
+    );
+    assert!(
+        offset_index < (1usize << offset_len),
+        "offset_index {} out of range for {} offset bits",
+        offset_index,
+        offset_len,
+    );
+
+    let high = layout.high_zeros();
+    let point_len = fold.tau_pos.len() + 2 + high + n_log_total;
+    let mut point = Vec::with_capacity(point_len);
+    point.extend_from_slice(&fold.tau_pos);
+    point.push(claims.sel_slot);
+    point.push(claims.side);
+    point.extend(std::iter::repeat_n(F128::ZERO, high));
+    point.extend_from_slice(&claims.instance_point);
+    for bit in 0..offset_len {
+        if (offset_index >> bit) & 1 == 1 {
+            point.push(F128::ONE);
+        } else {
+            point.push(F128::ZERO);
+        }
+    }
+    debug_assert_eq!(point.len(), point_len);
+
+    let sparse_eq = flock_core::pcs::ring_switch::build_eq_sparse(&point);
+    PackedDirectClaim {
+        point,
+        value: claims.value,
+        eq_ind: DirectEqInd::Sparse(sparse_eq),
+    }
+}
+
 /// Verifier-side helper: build the claim point identically to
 /// [`assemble_merkle_path_claim`] without constructing the sparse eq tensor.
 fn build_merkle_claim_point(
@@ -254,6 +368,40 @@ fn build_merkle_claim_point(
     point.push(claims.side);
     point.extend(std::iter::repeat_n(F128::ZERO, high));
     point.extend_from_slice(&claims.instance_point);
+    debug_assert_eq!(point.len(), point_len);
+    point
+}
+
+/// Verifier-side helper: build the claim point for the offset variant,
+/// identically to [`assemble_merkle_path_claim_at_offset`] but without the
+/// sparse eq tensor.
+pub fn build_merkle_claim_point_at_offset(
+    layout: &MerkleLayout,
+    fold: &MerklePathFold,
+    claims: &crate::merkle_path::MerklePathClaims,
+    block_offset: usize,
+    block_count: usize,
+    n_log_total: usize,
+) -> Vec<F128> {
+    let inst_log = claims.instance_point.len();
+    let offset_len = n_log_total - inst_log;
+    let offset_index = block_offset / block_count;
+
+    let high = layout.high_zeros();
+    let point_len = fold.tau_pos.len() + 2 + high + n_log_total;
+    let mut point = Vec::with_capacity(point_len);
+    point.extend_from_slice(&fold.tau_pos);
+    point.push(claims.sel_slot);
+    point.push(claims.side);
+    point.extend(std::iter::repeat_n(F128::ZERO, high));
+    point.extend_from_slice(&claims.instance_point);
+    for bit in 0..offset_len {
+        if (offset_index >> bit) & 1 == 1 {
+            point.push(F128::ONE);
+        } else {
+            point.push(F128::ZERO);
+        }
+    }
     debug_assert_eq!(point.len(), point_len);
     point
 }

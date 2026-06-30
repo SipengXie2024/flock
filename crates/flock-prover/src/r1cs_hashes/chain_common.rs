@@ -168,6 +168,51 @@ pub fn fold_in_out(
     (in_vals, out_vals)
 }
 
+/// Range variant of [`fold_in_out`]: folds only a contiguous sub-range of
+/// blocks within a larger packed witness buffer. Used by the pooled-commitment
+/// path where multiple node types share one `z_packed`.
+///
+/// * `block_offset` — first block index (0-based) within `packed` belonging to
+///   this node type.
+/// * `block_count` — number of blocks in this node type's range.
+pub fn fold_in_out_range(
+    layout: &ChainLayout,
+    packed: &[F128],
+    fold: &ChainFold,
+    block_offset: usize,
+    block_count: usize,
+) -> (Vec<F128>, Vec<F128>) {
+    use rayon::prelude::*;
+
+    let bits_per_packed = 1usize << LOG_PACKING;
+    let n_packed_per_region = 1usize << fold.tau_pos.len();
+    let block_packed = (1usize << layout.k_log) / bits_per_packed;
+    let in_pos_base = (layout.input_byte_off * 8) / bits_per_packed;
+    let out_pos_base = (layout.output_byte_off * 8) / bits_per_packed;
+    let n_inst = block_count;
+
+    let eq_tau = build_eq_table(&fold.tau_pos);
+
+    let fold_one = |base: usize| -> F128 {
+        let mut acc = F128::ZERO;
+        for pos in 0..n_packed_per_region {
+            acc += eq_tau[pos] * packed[base + pos];
+        }
+        acc
+    };
+
+    let in_vals: Vec<F128> = (0..n_inst)
+        .into_par_iter()
+        .map(|i| fold_one((block_offset + i) * block_packed + in_pos_base))
+        .collect();
+    let out_vals: Vec<F128> = (0..n_inst)
+        .into_par_iter()
+        .map(|i| fold_one((block_offset + i) * block_packed + out_pos_base))
+        .collect();
+
+    (in_vals, out_vals)
+}
+
 /// Assemble the packed-direct chain claim from the fold and the shift
 /// sumcheck output. The point layout (LSB-first over `L = m − LOG_PACKING`
 /// coords):
@@ -218,6 +263,109 @@ fn build_chain_claim_point(
     point.push(claims.sel0);
     point.extend(std::iter::repeat_n(F128::ZERO, high));
     point.extend_from_slice(&claims.instance_point);
+    debug_assert_eq!(point.len(), point_len);
+    point
+}
+
+/// Assemble a packed-direct chain claim that refers to a sub-range of a
+/// larger pooled polynomial. The point layout extends the per-commitment
+/// variant with offset bits that locate this node's block range:
+/// ```text
+///   [tau_pos ..., sel0, 0..0, instance_point ..., offset_bits ...]
+///     ^^^^^      ^^^^  ^^^^   ^^^^^^^^^^^^^^      ^^^^^^^^^^^^^
+///     fold       in/out high  sumcheck output     LSB-first binary
+///     coords     sel.   zeros (log2(block_count)  of block_offset /
+///                              coords from the    block_count
+///                              per-node shift)    (n_log_total -
+///                                                 log2(block_count)
+///                                                 coords)
+/// ```
+/// Total point length = `tau_pos.len() + 1 + high_zeros + n_log_total`.
+pub fn assemble_chain_claim_at_offset(
+    layout: &ChainLayout,
+    fold: &ChainFold,
+    claims: &crate::chain::ChainClaims,
+    block_offset: usize,
+    block_count: usize,
+    n_log_total: usize,
+) -> PackedDirectClaim {
+    let inst_log = claims.instance_point.len();
+    assert_eq!(
+        inst_log,
+        block_count.trailing_zeros() as usize,
+        "instance_point length must equal log2(block_count)"
+    );
+    assert!(
+        n_log_total >= inst_log,
+        "n_log_total must be >= log2(block_count)"
+    );
+    let offset_len = n_log_total - inst_log;
+    let offset_index = block_offset / block_count;
+    assert_eq!(
+        block_offset % block_count,
+        0,
+        "block_offset must be aligned to block_count"
+    );
+    assert!(
+        offset_index < (1usize << offset_len),
+        "offset_index {} out of range for {} offset bits",
+        offset_index,
+        offset_len,
+    );
+
+    let high = layout.high_zeros();
+    let point_len = fold.tau_pos.len() + 1 + high + n_log_total;
+    let mut point = Vec::with_capacity(point_len);
+    point.extend_from_slice(&fold.tau_pos);
+    point.push(claims.sel0);
+    point.extend(std::iter::repeat_n(F128::ZERO, high));
+    point.extend_from_slice(&claims.instance_point);
+    for bit in 0..offset_len {
+        if (offset_index >> bit) & 1 == 1 {
+            point.push(F128::ONE);
+        } else {
+            point.push(F128::ZERO);
+        }
+    }
+    debug_assert_eq!(point.len(), point_len);
+
+    let sparse_eq = flock_core::pcs::ring_switch::build_eq_sparse(&point);
+    PackedDirectClaim {
+        point,
+        value: claims.value,
+        eq_ind: DirectEqInd::Sparse(sparse_eq),
+    }
+}
+
+/// Verifier-side helper: build the chain-claim point for the offset variant,
+/// identically to [`assemble_chain_claim_at_offset`] but without the sparse eq
+/// tensor.
+pub fn build_chain_claim_point_at_offset(
+    layout: &ChainLayout,
+    fold: &ChainFold,
+    claims: &crate::chain::ChainClaims,
+    block_offset: usize,
+    block_count: usize,
+    n_log_total: usize,
+) -> Vec<F128> {
+    let inst_log = claims.instance_point.len();
+    let offset_len = n_log_total - inst_log;
+    let offset_index = block_offset / block_count;
+
+    let high = layout.high_zeros();
+    let point_len = fold.tau_pos.len() + 1 + high + n_log_total;
+    let mut point = Vec::with_capacity(point_len);
+    point.extend_from_slice(&fold.tau_pos);
+    point.push(claims.sel0);
+    point.extend(std::iter::repeat_n(F128::ZERO, high));
+    point.extend_from_slice(&claims.instance_point);
+    for bit in 0..offset_len {
+        if (offset_index >> bit) & 1 == 1 {
+            point.push(F128::ONE);
+        } else {
+            point.push(F128::ZERO);
+        }
+    }
     debug_assert_eq!(point.len(), point_len);
     point
 }

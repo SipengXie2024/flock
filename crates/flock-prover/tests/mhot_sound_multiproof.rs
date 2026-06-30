@@ -77,10 +77,18 @@ fn sound_multiproof_1_path() {
     let mut ch = FsChallenger::new(b"smp-1path");
     let proof = prove_sound_multiproof(&paths, &mut ch);
     assert_eq!(proof.n_paths, 1);
-    assert_eq!(proof.hash_proofs.len(), 3);
-    let root = proof.content_proofs[proof.path_mapping.node_indices[0][0]].content_hash;
+    assert_eq!(proof.merkle_shifts.len(), 3);
+    let root = proof.chain_content_hashes[proof.path_mapping.node_indices[0][0]];
     let mut chv = FsChallenger::new(b"smp-1path");
-    verify_sound_multiproof(&proof, &root, &mut chv).expect("single path must verify");
+    let res = verify_sound_multiproof(&proof, &root, &mut chv);
+    match &res {
+        Ok(()) => println!("  verify OK"),
+        Err(e) => println!("  verify FAILED: {:?}", e),
+    }
+    res.expect("single path must verify");
+
+    let size = proof.proof_size_bytes();
+    println!("  1-path proof size: {} bytes ({:.1} KB)", size, size as f64 / 1024.0);
 }
 
 #[test]
@@ -91,13 +99,17 @@ fn sound_multiproof_4_paths_shared() {
     let proof = prove_sound_multiproof(&paths, &mut ch);
     assert_eq!(proof.n_paths, 4);
     assert_eq!(
-        proof.hash_proofs.len(), 3,
+        proof.merkle_shifts.len(), 3,
         "4 identical paths should dedup to 3 unique nodes"
     );
     assert_eq!(proof.n_routes, 3);
-    let root = proof.content_proofs[proof.path_mapping.node_indices[0][0]].content_hash;
+
+    let root = proof.chain_content_hashes[proof.path_mapping.node_indices[0][0]];
     let mut chv = FsChallenger::new(b"smp-4shared");
     verify_sound_multiproof(&proof, &root, &mut chv).expect("4 shared paths must verify");
+
+    let size = proof.proof_size_bytes();
+    println!("  4-shared proof size: {} bytes ({:.1} KB)", size, size as f64 / 1024.0);
 }
 
 #[test]
@@ -106,8 +118,8 @@ fn sound_multiproof_tampered_content_hash() {
     let paths = vec![path];
     let mut ch = FsChallenger::new(b"smp-tamper-ch");
     let mut proof = prove_sound_multiproof(&paths, &mut ch);
-    let root = proof.content_proofs[proof.path_mapping.node_indices[0][0]].content_hash;
-    proof.content_proofs[1].content_hash[0] ^= 1;
+    let root = proof.chain_content_hashes[proof.path_mapping.node_indices[0][0]];
+    proof.chain_content_hashes[1][0] ^= 1;
     let mut chv = FsChallenger::new(b"smp-tamper-ch");
     match verify_sound_multiproof(&proof, &root, &mut chv) {
         Err(MhotMembershipError::ContentHashMismatch { .. }) => {}
@@ -121,8 +133,8 @@ fn sound_multiproof_wrong_root() {
     let path = linked_inputs(&[8, 4, 2]);
     let paths = vec![path];
     let mut ch = FsChallenger::new(b"smp-wrong-root");
-    let mut proof = prove_sound_multiproof(&paths, &mut ch);
-    let mut root = proof.content_proofs[proof.path_mapping.node_indices[0][0]].content_hash;
+    let proof = prove_sound_multiproof(&paths, &mut ch);
+    let mut root = proof.chain_content_hashes[proof.path_mapping.node_indices[0][0]];
     root[0] ^= 1;
     let mut chv = FsChallenger::new(b"smp-wrong-root");
     match verify_sound_multiproof(&proof, &root, &mut chv) {

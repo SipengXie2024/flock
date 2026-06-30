@@ -518,7 +518,7 @@ fn ligerito_verifier_config(
         .expect("Ligerito default verifier config")
 }
 
-fn fork_pcs_challenger(parent: &FsChallenger, base_label: &[u8]) -> FsChallenger {
+pub(crate) fn fork_pcs_challenger(parent: &FsChallenger, base_label: &[u8]) -> FsChallenger {
     let mut challenger = parent.clone();
     challenger.observe_label(b"mhot-multiproof-pcs-fork-v0");
     challenger.observe_label(base_label);

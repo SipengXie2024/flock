@@ -65,7 +65,7 @@ fn sound_vs_native_benchmark() {
         let json = match std::fs::read_to_string(&filename) {
             Ok(j) => j,
             Err(_) => {
-                eprintln!("{:>6}  (skipped — {} not found, run persistent-hot export first)", n, filename);
+                eprintln!("{:>6}  (skipped — {} not found)", n, filename);
                 continue;
             }
         };
@@ -80,7 +80,8 @@ fn sound_vs_native_benchmark() {
         let proof = prove_sound_multiproof(&paths, &mut ch);
         let prove_ms = t0.elapsed().as_secs_f64() * 1e3;
 
-        let root = proof.content_proofs[proof.path_mapping.node_indices[0][0]].content_hash;
+        let root_u = proof.path_mapping.node_indices[0][0];
+        let root = proof.chain_content_hashes[root_u];
         let mut chv = FsChallenger::new(b"sound-vs-native");
         let t1 = Instant::now();
         verify_sound_multiproof(&proof, &root, &mut chv).expect("must verify");
@@ -89,8 +90,8 @@ fn sound_vs_native_benchmark() {
         let flock_bytes = proof.proof_size_bytes();
         let native_kb = data.native_single_proof_total_bytes as f64 / 1024.0;
         let flock_kb = flock_bytes as f64 / 1024.0;
-        let ratio = native_kb / flock_kb;
-        let unique = proof.hash_proofs.len();
+        let ratio = flock_kb / native_kb;
+        let unique = proof.merkle_leaves.len();
 
         eprintln!("{:>6} {:>10.1} {:>10.1} {:>7.1}x {:>10.2} {:>10.1} {:>10.1} {:>8}",
             n, native_kb, flock_kb, ratio,
