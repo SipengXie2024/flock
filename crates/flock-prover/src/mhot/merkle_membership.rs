@@ -262,9 +262,8 @@ pub fn compute_content_hash(meta: &ContentMeta, merkle_root: &[u8; 32]) -> [u8; 
 /// Within-block packed index of SELECTED_OUT_FINAL's first F128. It is
 /// DIGEST_BITS-aligned, so it spans two consecutive F128 slots:
 /// SOF_PACKED_BASE and SOF_PACKED_BASE + 1.
-const SOF_PACKED_BASE: usize = route::SELECTED_OUT_FINAL_BASE / 128;
-/// F128 slots per route block.
-const BLOCK_PACKED: usize = route::K / 128;
+pub(crate) const SOF_PACKED_BASE: usize = route::SELECTED_OUT_FINAL_BASE / 128;
+pub(crate) const BLOCK_PACKED: usize = route::K / 128;
 
 /// One membership step: the MHOT node, route witness, and content metadata.
 #[derive(Clone)]
@@ -329,7 +328,7 @@ pub fn mhot_node_to_route_witness(node: &MhotNodeWitness) -> RouteF32Witness {
 }
 
 /// `[u8; 32]` digest → `[bool; 256]` in byte-major, LSB-first-within-byte order.
-fn digest_bytes_to_route_bits(d: &[u8; 32]) -> [bool; route::DIGEST_BITS] {
+pub(crate) fn digest_bytes_to_route_bits(d: &[u8; 32]) -> [bool; route::DIGEST_BITS] {
     let mut bits = [false; route::DIGEST_BITS];
     for (byte_i, &byte) in d.iter().enumerate() {
         for k in 0..8 {
@@ -340,7 +339,7 @@ fn digest_bytes_to_route_bits(d: &[u8; 32]) -> [bool; route::DIGEST_BITS] {
 }
 
 /// Recover the `[u8; 32]` digest from a SHA-256 leaf (big-endian words).
-fn leaf_words_to_digest_bytes(leaf: &[u32; 8]) -> [u8; 32] {
+pub(crate) fn leaf_words_to_digest_bytes(leaf: &[u32; 8]) -> [u8; 32] {
     let mut d = [0u8; 32];
     for i in 0..8 {
         d[4 * i..4 * i + 4].copy_from_slice(&leaf[i].to_be_bytes());
@@ -349,7 +348,7 @@ fn leaf_words_to_digest_bytes(leaf: &[u32; 8]) -> [u8; 32] {
 }
 
 /// Pack up to 128 bools into one F128 (lo = bits 0..64, hi = bits 64..128).
-fn pack_bits_to_f128(bits: &[bool]) -> F128 {
+pub(crate) fn pack_bits_to_f128(bits: &[bool]) -> F128 {
     assert!(bits.len() <= 128, "pack_bits_to_f128: slice length {} > 128", bits.len());
     let mut lo = 0u64;
     let mut hi = 0u64;
@@ -366,7 +365,7 @@ fn pack_bits_to_f128(bits: &[bool]) -> F128 {
 }
 
 /// The two SELECTED_OUT_FINAL F128 values for a child digest given as bytes.
-fn digest_to_sof_f128(d: &[u8; 32]) -> [F128; 2] {
+pub(crate) fn digest_to_sof_f128(d: &[u8; 32]) -> [F128; 2] {
     let bits = digest_bytes_to_route_bits(d);
     [
         pack_bits_to_f128(&bits[0..128]),
@@ -377,7 +376,7 @@ fn digest_to_sof_f128(d: &[u8; 32]) -> [F128; 2] {
 /// The two SELECTED_OUT_FINAL F128 values the route R1CS produces for this
 /// witness: the digest of the child whose 5-bit index equals the extracted
 /// key bits. Matches what is committed in the route z_packed.
-fn route_sof_f128(rw: &RouteF32Witness) -> [F128; 2] {
+pub(crate) fn route_sof_f128(rw: &RouteF32Witness) -> [F128; 2] {
     let mut idx = 0usize;
     for j in 0..route::W_MAX {
         if rw.key[j] && rw.mask[j] {
@@ -391,7 +390,7 @@ fn route_sof_f128(rw: &RouteF32Witness) -> [F128; 2] {
     ]
 }
 
-fn fork_content_challenger(parent: &FsChallenger, node_idx: usize) -> FsChallenger {
+pub(crate) fn fork_content_challenger(parent: &FsChallenger, node_idx: usize) -> FsChallenger {
     let mut ch = parent.clone();
     ch.observe_label(b"mhot-content-chain-fork-v0");
     ch.observe_bytes(&(node_idx as u64).to_le_bytes());
@@ -401,7 +400,7 @@ fn fork_content_challenger(parent: &FsChallenger, node_idx: usize) -> FsChalleng
 /// PackedDirectClaim point selecting route instance `instance`'s F128 at
 /// within-block packed index `within`: the LSB-first binary expansion of the
 /// global packed index over `L = m − LOG_PACKING` coords.
-fn pd_point(setup: &RouteF32Setup, instance: usize, within: usize) -> Vec<F128> {
+pub(crate) fn pd_point(setup: &RouteF32Setup, instance: usize, within: usize) -> Vec<F128> {
     let gpi = instance * BLOCK_PACKED + within;
     let l = setup.r1cs.m - pcs::LOG_PACKING;
     (0..l)
@@ -525,7 +524,10 @@ pub fn verify_membership(
             .map_err(|e| MhotMembershipError::ContentChainVerify(i, e))?;
         challenger.observe_bytes(&cp.commitment.root);
 
-        let n_pad = cp.n_compressions.saturating_sub(cp.n_real_compressions);
+        if cp.n_real_compressions > cp.n_compressions {
+            return Err(MhotMembershipError::ContentHashMismatch { node_idx: i });
+        }
+        let n_pad = cp.n_compressions - cp.n_real_compressions;
         let mut expected_cv = cp.content_hash;
         for _ in 0..n_pad {
             expected_cv = sha256_compress(&expected_cv, &[0u32; 16]);

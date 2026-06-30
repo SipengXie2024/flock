@@ -13,13 +13,12 @@ use flock_core::zerocheck::ZerocheckProof;
 
 use super::merkle_membership::{
     ContentChainProof, MhotMembershipError, MhotMembershipInput,
-    NodeMerkleProof, build_content_hash_chain, prove_node_merkle, verify_node_merkle,
+    NodeMerkleProof, SOF_PACKED_BASE, build_content_hash_chain,
+    digest_to_sof_f128, fork_content_challenger, leaf_words_to_digest_bytes,
+    pd_point, prove_node_merkle, route_sof_f128, verify_node_merkle,
 };
 use super::multiproof::{open_core_ligerito, verify_core_opening_ligerito};
 use super::route_f32::{self as route, RouteF32Setup};
-
-const SOF_PACKED_BASE: usize = route::SELECTED_OUT_FINAL_BASE / 128;
-const BLOCK_PACKED: usize = route::K / 128;
 
 pub struct PathMapping {
     pub node_indices: Vec<Vec<usize>>,
@@ -38,11 +37,11 @@ pub struct SoundMultiproof {
     pub n_paths: usize,
     pub path_depths: Vec<usize>,
     pub path_mapping: PathMapping,
-    pub expected_root: [u32; 8],
 }
 
 fn node_identity(input: &MhotMembershipInput) -> Vec<u8> {
     let mut bytes = Vec::new();
+    bytes.extend_from_slice(&(input.node.children.len() as u32).to_le_bytes());
     for child in &input.node.children {
         bytes.extend_from_slice(child);
     }
@@ -50,72 +49,15 @@ fn node_identity(input: &MhotMembershipInput) -> Vec<u8> {
     for &mask in &input.content.extraction_masks {
         bytes.extend_from_slice(&mask.to_le_bytes());
     }
+    bytes.extend_from_slice(&(input.content.sparse_partial_keys.len() as u32).to_le_bytes());
     for &key in &input.content.sparse_partial_keys {
         bytes.extend_from_slice(&key.to_le_bytes());
     }
+    bytes.extend_from_slice(&(input.content.child_leaf_counts.len() as u32).to_le_bytes());
     for &count in &input.content.child_leaf_counts {
         bytes.extend_from_slice(&count.to_le_bytes());
     }
     bytes
-}
-
-fn leaf_words_to_digest_bytes(leaf: &[u32; 8]) -> [u8; 32] {
-    let mut d = [0u8; 32];
-    for i in 0..8 {
-        d[4 * i..4 * i + 4].copy_from_slice(&leaf[i].to_be_bytes());
-    }
-    d
-}
-
-fn digest_bytes_to_route_bits(d: &[u8; 32]) -> [bool; route::DIGEST_BITS] {
-    let mut bits = [false; route::DIGEST_BITS];
-    for (byte_i, &byte) in d.iter().enumerate() {
-        for k in 0..8 {
-            bits[byte_i * 8 + k] = (byte >> k) & 1 == 1;
-        }
-    }
-    bits
-}
-
-fn pack_bits_to_f128(bits: &[bool]) -> F128 {
-    assert!(bits.len() <= 128);
-    let mut lo = 0u64;
-    let mut hi = 0u64;
-    for (k, &b) in bits.iter().enumerate() {
-        if b {
-            if k < 64 { lo |= 1u64 << k; } else { hi |= 1u64 << (k - 64); }
-        }
-    }
-    F128 { lo, hi }
-}
-
-fn digest_to_sof_f128(d: &[u8; 32]) -> [F128; 2] {
-    let bits = digest_bytes_to_route_bits(d);
-    [pack_bits_to_f128(&bits[0..128]), pack_bits_to_f128(&bits[128..256])]
-}
-
-fn route_sof_f128(rw: &route::RouteF32Witness) -> [F128; 2] {
-    let mut idx = 0usize;
-    for j in 0..route::W_MAX {
-        if rw.key[j] && rw.mask[j] { idx |= 1 << j; }
-    }
-    let bits = &rw.children[idx];
-    [pack_bits_to_f128(&bits[0..128]), pack_bits_to_f128(&bits[128..256])]
-}
-
-fn fork_content_challenger(parent: &FsChallenger, node_idx: usize) -> FsChallenger {
-    let mut ch = parent.clone();
-    ch.observe_label(b"mhot-content-chain-fork-v0");
-    ch.observe_bytes(&(node_idx as u64).to_le_bytes());
-    ch
-}
-
-fn pd_point(setup: &RouteF32Setup, instance: usize, within: usize) -> Vec<F128> {
-    let gpi = instance * BLOCK_PACKED + within;
-    let l = setup.r1cs.m - pcs::LOG_PACKING;
-    (0..l)
-        .map(|k| if (gpi >> k) & 1 == 1 { F128::ONE } else { F128::ZERO })
-        .collect()
 }
 
 pub fn prove_sound_multiproof(
@@ -212,10 +154,6 @@ pub fn prove_sound_multiproof(
         challenger,
     );
 
-    // -- Compute expected root from path 0's top node --
-    let root_u = node_indices_per_path[0][0];
-    let expected_root = content_proofs[root_u].content_hash;
-
     SoundMultiproof {
         hash_proofs,
         content_proofs,
@@ -227,17 +165,21 @@ pub fn prove_sound_multiproof(
         n_paths: paths.len(),
         path_depths,
         path_mapping: PathMapping { node_indices: node_indices_per_path },
-        expected_root,
     }
 }
 
 pub fn verify_sound_multiproof(
     proof: &SoundMultiproof,
+    expected_root: &[u32; 8],
     challenger: &mut FsChallenger,
 ) -> Result<(), MhotMembershipError> {
     let u = proof.hash_proofs.len();
-    assert_eq!(u, proof.content_proofs.len());
-    assert!(u > 0, "empty proof");
+    if u == 0 || u != proof.content_proofs.len() {
+        return Err(MhotMembershipError::RootMismatch {
+            expected: *expected_root,
+            actual: [0; 8],
+        });
+    }
 
     // -- Hash base --
     for hp in &proof.hash_proofs {
@@ -253,11 +195,9 @@ pub fn verify_sound_multiproof(
             .map_err(|e| MhotMembershipError::ContentChainVerify(i, e))?;
         challenger.observe_bytes(&cp.commitment.root);
 
-        assert!(
-            cp.n_real_compressions <= cp.n_compressions,
-            "n_real_compressions ({}) > n_compressions ({})",
-            cp.n_real_compressions, cp.n_compressions,
-        );
+        if cp.n_real_compressions > cp.n_compressions {
+            return Err(MhotMembershipError::ContentHashMismatch { node_idx: i });
+        }
         let n_pad = cp.n_compressions - cp.n_real_compressions;
         let mut expected_cv = cp.content_hash;
         for _ in 0..n_pad {
@@ -270,10 +210,19 @@ pub fn verify_sound_multiproof(
 
     // -- Cross-node binding (per path) --
     for (p, indices) in proof.path_mapping.node_indices.iter().enumerate() {
-        assert_eq!(indices.len(), proof.path_depths[p]);
+        if p >= proof.path_depths.len() || indices.len() != proof.path_depths[p] {
+            return Err(MhotMembershipError::RootMismatch {
+                expected: *expected_root, actual: [0; 8],
+            });
+        }
         for i in 0..indices.len().saturating_sub(1) {
             let parent_u = indices[i];
             let child_u = indices[i + 1];
+            if parent_u >= u || child_u >= u {
+                return Err(MhotMembershipError::RootMismatch {
+                    expected: *expected_root, actual: [0; 8],
+                });
+            }
             let parent_leaf = proof.hash_proofs[parent_u].leaf;
             let child_content = proof.content_proofs[child_u].content_hash;
             if parent_leaf != child_content {
@@ -288,10 +237,20 @@ pub fn verify_sound_multiproof(
 
     // -- Root check: every path's top node must match expected_root --
     for indices in &proof.path_mapping.node_indices {
-        let root_u = indices[0];
-        if proof.content_proofs[root_u].content_hash != proof.expected_root {
+        if indices.is_empty() {
             return Err(MhotMembershipError::RootMismatch {
-                expected: proof.expected_root,
+                expected: *expected_root, actual: [0; 8],
+            });
+        }
+        let root_u = indices[0];
+        if root_u >= u {
+            return Err(MhotMembershipError::RootMismatch {
+                expected: *expected_root, actual: [0; 8],
+            });
+        }
+        if proof.content_proofs[root_u].content_hash != *expected_root {
+            return Err(MhotMembershipError::RootMismatch {
+                expected: *expected_root,
                 actual: proof.content_proofs[root_u].content_hash,
             });
         }
