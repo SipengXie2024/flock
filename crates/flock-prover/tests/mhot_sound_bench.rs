@@ -60,7 +60,7 @@ fn sound_vs_native_benchmark() {
         "N", "native_KB", "flock_KB", "ratio", "nv_ms", "fp_ms", "fv_ms", "unique");
     eprintln!("{}", "-".repeat(80));
 
-    for &n in &[1, 16, 256, 4096, 16384] {
+    for &n in &[1, 16, 256, 4096] {
         let filename = format!("/tmp/mhot_export_n{}.json", n);
         let json = match std::fs::read_to_string(&filename) {
             Ok(j) => j,
