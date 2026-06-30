@@ -417,6 +417,9 @@ pub fn verify_sound_multiproof(
         });
     }
 
+    let vt = std::env::var_os("VERIFY_BREAKDOWN").is_some();
+    let t0 = std::time::Instant::now();
+
     // -- Verify merkle core --
     let merkle_n_total = 1usize << proof.n_log_merkle;
     let merkle_setup = Sha256HybridSetup::cached(merkle_n_total);
@@ -427,6 +430,7 @@ pub fn verify_sound_multiproof(
         challenger,
     ).map_err(MhotMembershipError::NodeVerify2)?;
 
+    let t1 = std::time::Instant::now();
     // -- Merkle shifts --
     let merkle_tau_pos = challenger.sample_f128_vec(MERKLE_LAYOUT.tau_pos_len());
     let merkle_fold = MerklePathFold::new(&MERKLE_LAYOUT, merkle_tau_pos);
@@ -458,6 +462,7 @@ pub fn verify_sound_multiproof(
         merkle_pd_refs_data.push((point, claims.value));
     }
 
+    let t2 = std::time::Instant::now();
     // -- Merkle PCS verify (forked challenger) --
     let merkle_pd_refs: Vec<PackedDirectClaimRef> = merkle_pd_refs_data
         .iter().map(|(p, v)| PackedDirectClaimRef { point: p, value: *v }).collect();
@@ -469,6 +474,7 @@ pub fn verify_sound_multiproof(
         &merkle_ab, &merkle_c, &merkle_pd_refs, &mut merkle_pcs_ch,
     ).map_err(MhotMembershipError::NodeVerify2)?;
 
+    let t3 = std::time::Instant::now();
     // -- Verify chain core --
     let chain_n_total = 1usize << proof.n_log_chain;
     let chain_setup = Sha256HybridSetup::cached(chain_n_total);
@@ -518,6 +524,7 @@ pub fn verify_sound_multiproof(
         }
     }
 
+    let t4 = std::time::Instant::now();
     // -- Chain PCS verify (forked challenger) --
     let chain_pd_refs: Vec<PackedDirectClaimRef> = chain_pd_refs_data
         .iter().map(|(p, v)| PackedDirectClaimRef { point: p, value: *v }).collect();
@@ -529,6 +536,7 @@ pub fn verify_sound_multiproof(
         &chain_ab, &chain_c, &chain_pd_refs, &mut chain_pcs_ch,
     ).map_err(MhotMembershipError::NodeVerify2)?;
 
+    let t5 = std::time::Instant::now();
     // -- Cross-node binding (per path) --
     for (p, indices) in proof.path_mapping.node_indices.iter().enumerate() {
         if p >= proof.path_depths.len() || indices.len() != proof.path_depths[p] {
@@ -577,6 +585,7 @@ pub fn verify_sound_multiproof(
         }
     }
 
+    let t6 = std::time::Instant::now();
     // -- Route verify core --
     let route_setup = RouteF32Setup::cached(proof.n_routes);
     let (route_ab, route_c) = flock_core::verifier::verify_core(
@@ -603,5 +612,11 @@ pub fn verify_sound_multiproof(
         &route_ab, &route_c, &route_pd_refs, &mut route_pcs_ch,
     ).map_err(MhotMembershipError::RouteOpening)?;
 
+    let t7 = std::time::Instant::now();
+    if vt {
+        let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
+        eprintln!("[verify] merkle_core={:.1}ms merkle_shifts={:.1}ms merkle_pcs={:.1}ms chain_core={:.1}ms chain_shifts={:.1}ms chain_pcs={:.1}ms cross+root={:.1}ms route={:.1}ms total={:.1}ms",
+            ms(t1-t0), ms(t2-t1), ms(t3-t2), ms(t4-t3), ms(t5-t4), ms(t6-t5), ms(t6.duration_since(t5)), ms(t7-t6), ms(t7-t0));
+    }
     Ok(())
 }
