@@ -28,6 +28,7 @@ pub enum MhotMembershipError {
     },
     RouteVerify(VerifyError),
     RouteOpening(VerifyError),
+    ContentChainVerify(usize, ChainVerifyError),
     RootMismatch {
         expected: [u32; 8],
         actual: [u32; 8],
@@ -174,6 +175,87 @@ fn pad_to_needed(
 }
 
 // ---------------------------------------------------------------------------
+// Content hash chain (Task 2): SHA-256(masks ‖ partial_keys ‖ merkle_root ‖ counts)
+// proved as a sequential SHA-256 chain via chain_common.
+// ---------------------------------------------------------------------------
+
+use crate::r1cs_hashes::sha2::ChainVerifyError;
+use crate::r1cs_hashes::chain_common::ChainProofLigerito;
+
+/// Content metadata needed to compute the native content_hash for one node.
+#[derive(Clone, Debug)]
+pub struct ContentMeta {
+    pub extraction_masks: [u64; 4],
+    pub sparse_partial_keys: Vec<u32>,
+    pub child_leaf_counts: Vec<u32>,
+}
+
+/// Build the SHA-256 Merkle-Damgard chain for content_hash.
+///
+/// Returns `(compressions, content_hash)` where compressions are padded to
+/// a power of 2 ≥ 8 for Flock's chain protocol.
+pub fn build_content_hash_chain(
+    meta: &ContentMeta,
+    merkle_root: &[u8; 32],
+) -> (Vec<Compression>, [u32; 8]) {
+    let mut data = Vec::new();
+    for &mask in &meta.extraction_masks {
+        data.extend_from_slice(&mask.to_le_bytes());
+    }
+    for &key in &meta.sparse_partial_keys {
+        data.extend_from_slice(&key.to_le_bytes());
+    }
+    data.extend_from_slice(merkle_root);
+    for &count in &meta.child_leaf_counts {
+        data.extend_from_slice(&count.to_le_bytes());
+    }
+
+    let data_len_bits = (data.len() as u64) * 8;
+    data.push(0x80);
+    while data.len() % 64 != 56 {
+        data.push(0);
+    }
+    data.extend_from_slice(&data_len_bits.to_be_bytes());
+    assert_eq!(data.len() % 64, 0);
+
+    let n_real = data.len() / 64;
+    let min_m = 22;
+    let min_n = 1usize << (min_m - 15); // K_LOG=15; minimum Ligerito config
+    let n_padded = n_real.max(min_n).next_power_of_two();
+
+    let mut compressions = Vec::with_capacity(n_padded);
+    let mut cv = SHA256_IV;
+    for block in data.chunks_exact(64) {
+        let mut m = [0u32; 16];
+        for (i, chunk) in block.chunks_exact(4).enumerate() {
+            m[i] = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        }
+        compressions.push((cv, m));
+        cv = sha256_compress(&cv, &m);
+    }
+    let content_hash = cv;
+
+    while compressions.len() < n_padded {
+        let m = [0u32; 16];
+        compressions.push((cv, m));
+        cv = sha256_compress(&cv, &m);
+    }
+
+    (compressions, content_hash)
+}
+
+/// Compute content_hash natively (for verifier-side checks). Matches
+/// `mhot-verify/src/proof.rs::compute_node_content_hash`.
+pub fn compute_content_hash(meta: &ContentMeta, merkle_root: &[u8; 32]) -> [u8; 32] {
+    let (_, cv) = build_content_hash_chain(meta, merkle_root);
+    let mut out = [0u8; 32];
+    for i in 0..8 {
+        out[4 * i..4 * i + 4].copy_from_slice(&cv[i].to_be_bytes());
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Route↔hash binding (Task 1): one membership proof tying the route R1CS
 // (PEXT matching + content soundness) to the in-node SHA-256 Merkle proof.
 // Two independent commitments (hash + route) are bound by opening the route
@@ -188,27 +270,43 @@ const SOF_PACKED_BASE: usize = route::SELECTED_OUT_FINAL_BASE / 128;
 /// F128 slots per route block.
 const BLOCK_PACKED: usize = route::K / 128;
 
-/// One membership step: the MHOT node plus the route witness that PEXT-routes
-/// to the selected child.
+/// One membership step: the MHOT node, route witness, and content metadata.
 #[derive(Clone)]
 pub struct MhotMembershipInput {
     pub node: MhotNodeWitness,
     pub route_witness: RouteF32Witness,
+    pub content: ContentMeta,
 }
 
 impl MhotMembershipInput {
-    /// Build an input whose route witness PEXT-routes to `node.selected_child`.
+    /// Build an input with synthetic content metadata (for tests).
     pub fn from_node(node: MhotNodeWitness) -> Self {
         let route_witness = mhot_node_to_route_witness(&node);
-        Self { node, route_witness }
+        let nc = node.children.len();
+        let content = ContentMeta {
+            extraction_masks: [0x1F; 4],
+            sparse_partial_keys: vec![0; nc],
+            child_leaf_counts: vec![1; nc],
+        };
+        Self { node, route_witness, content }
     }
 }
 
+/// Per-node content hash chain proof.
+pub struct ContentChainProof {
+    pub proof: ChainProofLigerito,
+    pub commitment: Commitment,
+    pub content_hash: [u32; 8],
+    pub cv_last: [u32; 8],
+    pub n_compressions: usize,
+}
+
 /// A sound membership proof for one MHOT path: per-node SHA-256 Merkle path
-/// proofs (hash base) + one batched route R1CS proof (route base), bound by
-/// PackedDirectClaims over the route commitment.
+/// proofs (hash base) + per-node content hash chain proofs + one batched
+/// route R1CS proof (route base), bound by PackedDirectClaims.
 pub struct MhotMembershipProof {
     pub hash_proofs: Vec<NodeMerkleProof>,
+    pub content_proofs: Vec<ContentChainProof>,
     pub route_zc: ZerocheckProof,
     pub route_lc: LincheckProof,
     pub route_pcs: BatchOpeningProofLigerito,
@@ -296,6 +394,13 @@ fn route_sof_f128(rw: &RouteF32Witness) -> [F128; 2] {
     ]
 }
 
+fn fork_content_challenger(parent: &FsChallenger, node_idx: usize) -> FsChallenger {
+    let mut ch = parent.clone();
+    ch.observe_label(b"mhot-content-chain-fork-v0");
+    ch.observe_bytes(&(node_idx as u64).to_le_bytes());
+    ch
+}
+
 /// PackedDirectClaim point selecting route instance `instance`'s F128 at
 /// within-block packed index `within`: the LSB-first binary expansion of the
 /// global packed index over `L = m − LOG_PACKING` coords.
@@ -317,6 +422,28 @@ pub fn prove_membership(
     // ---- Hash base: per-node in-node Merkle path proofs (threads challenger).
     let nodes: Vec<MhotNodeWitness> = path.iter().map(|p| p.node.clone()).collect();
     let hash_proofs = prove_path_merkle(&nodes, challenger);
+
+    // ---- Content hash chain: per-node SHA-256(masks ‖ keys ‖ merkle_root ‖ counts).
+    // Each chain uses a forked challenger (observe commitment in main to bind),
+    // so the chain's internal challenges don't shift the main challenger state.
+    let content_proofs: Vec<ContentChainProof> = path
+        .iter()
+        .zip(hash_proofs.iter())
+        .enumerate()
+        .map(|(idx, (input, hp))| {
+            let merkle_root_bytes = leaf_words_to_digest_bytes(&hp.native_root);
+            let (compressions, content_hash) =
+                build_content_hash_chain(&input.content, &merkle_root_bytes);
+            let n = compressions.len();
+            let last = &compressions[n - 1];
+            let cv_last = sha256_compress(&last.0, &last.1);
+            let setup = Sha256HybridSetup::new(n);
+            let mut chain_ch = fork_content_challenger(challenger, idx);
+            let (proof, commitment) = setup.prove_chain(&compressions, &mut chain_ch);
+            challenger.observe_bytes(&commitment.root);
+            ContentChainProof { proof, commitment, content_hash, cv_last, n_compressions: n }
+        })
+        .collect();
 
     // ---- Route base: batch all route witnesses into one commitment.
     let route_witnesses: Vec<RouteF32Witness> =
@@ -361,6 +488,7 @@ pub fn prove_membership(
 
     MhotMembershipProof {
         hash_proofs,
+        content_proofs,
         route_zc: route_open.zc_proof,
         route_lc: route_open.lc_proof,
         route_pcs: route_open.pcs_open,
@@ -377,15 +505,47 @@ pub fn verify_membership(
     challenger: &mut FsChallenger,
 ) -> Result<(), MhotMembershipError> {
     assert!(!proof.hash_proofs.is_empty(), "empty membership proof");
+    assert_eq!(
+        proof.hash_proofs.len(),
+        proof.content_proofs.len(),
+        "hash_proofs and content_proofs must have the same length"
+    );
 
-    // ---- Hash base + cross-node binding (threads challenger).
-    verify_path_merkle(&proof.hash_proofs, challenger)?;
+    // ---- Hash base: verify each node's in-node Merkle path.
+    for hp in &proof.hash_proofs {
+        verify_node_merkle(hp, challenger).map_err(MhotMembershipError::NodeVerify)?;
+    }
 
-    // ---- Public root = the top node's in-node Merkle root.
-    if proof.hash_proofs[0].root != *expected_root {
+    // ---- Content hash chain: verify each node's chain (forked challenger).
+    for (i, cp) in proof.content_proofs.iter().enumerate() {
+        let setup = Sha256HybridSetup::new(cp.n_compressions);
+        let mut chain_ch = fork_content_challenger(challenger, i);
+        setup
+            .verify_chain(&cp.commitment, &cp.proof, &SHA256_IV, &cp.cv_last, &mut chain_ch)
+            .map_err(|e| MhotMembershipError::ContentChainVerify(i, e))?;
+        challenger.observe_bytes(&cp.commitment.root);
+    }
+
+    // Cross-node binding: parent's hash leaf == child's content_hash.
+    // content_hash is authenticated by the chain proof (SHA256_IV → cv_last
+    // passes through content_hash; chain shift-sumcheck guarantees it).
+    for i in 0..proof.hash_proofs.len().saturating_sub(1) {
+        let parent_leaf = proof.hash_proofs[i].leaf;
+        let child_content_hash = proof.content_proofs[i + 1].content_hash;
+        if parent_leaf != child_content_hash {
+            return Err(MhotMembershipError::CrossNodeBinding {
+                parent_idx: i,
+                parent_leaf: parent_leaf,
+                child_root: child_content_hash,
+            });
+        }
+    }
+
+    // ---- Public root = the top node's content_hash (native node identity).
+    if proof.content_proofs[0].content_hash != *expected_root {
         return Err(MhotMembershipError::RootMismatch {
             expected: *expected_root,
-            actual: proof.hash_proofs[0].root,
+            actual: proof.content_proofs[0].content_hash,
         });
     }
 

@@ -1,8 +1,9 @@
 use flock_core::challenger::FsChallenger;
 use flock_prover::mhot::{
     merkle_membership::{
-        mhot_node_to_route_witness, prove_membership, prove_node_merkle, prove_path_merkle,
-        verify_membership, verify_node_merkle, verify_path_merkle, MhotMembershipError,
+        build_content_hash_chain, compute_content_hash, mhot_node_to_route_witness,
+        prove_membership, prove_node_merkle, prove_path_merkle, verify_membership,
+        verify_node_merkle, verify_path_merkle, ContentMeta, MhotMembershipError,
         MhotMembershipInput,
     },
     native_witness::{MhotNodeWitness, mhot_node_to_sha256_merkle},
@@ -236,11 +237,62 @@ fn cross_node_binding_mismatch_fails() {
 
 // --- route↔hash binding (Task 1): prove_membership / verify_membership ---
 
+fn synthetic_content(nc: usize) -> ContentMeta {
+    ContentMeta {
+        extraction_masks: [0x1F; 4],
+        sparse_partial_keys: vec![0; nc],
+        child_leaf_counts: vec![1; nc],
+    }
+}
+
+fn node_content_hash_bytes(node: &MhotNodeWitness, content: &ContentMeta) -> [u8; 32] {
+    let w = mhot_node_to_sha256_merkle(node);
+    let merkle_root = words_to_bytes_helper(&w.native_root);
+    compute_content_hash(content, &merkle_root)
+}
+
 fn linked_inputs(fanouts: &[usize]) -> Vec<MhotMembershipInput> {
-    build_linked_path(fanouts)
-        .into_iter()
-        .map(MhotMembershipInput::from_node)
-        .collect()
+    let depth = fanouts.len();
+    let mut inputs_rev = Vec::with_capacity(depth);
+
+    let leaf_children: Vec<[u8; 32]> = (0..fanouts[depth - 1])
+        .map(|i| {
+            let mut h = [0u8; 32];
+            h[0] = i as u8;
+            h[1] = 0xAA;
+            h
+        })
+        .collect();
+    let leaf_node = MhotNodeWitness {
+        children: leaf_children,
+        selected_child: 0,
+    };
+    let leaf_content = synthetic_content(leaf_node.children.len());
+    let mut child_content_hash = node_content_hash_bytes(&leaf_node, &leaf_content);
+    inputs_rev.push(MhotMembershipInput::from_node(leaf_node));
+
+    for level in (0..depth - 1).rev() {
+        let fanout = fanouts[level];
+        let selected = 1.min(fanout - 1);
+        let mut children: Vec<[u8; 32]> = (0..fanout)
+            .map(|i| {
+                let mut h = [0u8; 32];
+                h[0] = (level * 31 + i * 17) as u8;
+                h[1] = level as u8;
+                h
+            })
+            .collect();
+        children[selected] = child_content_hash;
+        let node = MhotNodeWitness {
+            children,
+            selected_child: selected,
+        };
+        let content = synthetic_content(node.children.len());
+        child_content_hash = node_content_hash_bytes(&node, &content);
+        inputs_rev.push(MhotMembershipInput::from_node(node));
+    }
+    inputs_rev.reverse();
+    inputs_rev
 }
 
 #[test]
@@ -248,7 +300,7 @@ fn membership_single_path_roundtrip() {
     let inputs = linked_inputs(&[8, 4, 2]);
     let mut ch = FsChallenger::new(b"mhot-membership");
     let proof = prove_membership(&inputs, &mut ch);
-    let root = proof.hash_proofs[0].root;
+    let root = proof.content_proofs[0].content_hash;
     let mut chv = FsChallenger::new(b"mhot-membership");
     verify_membership(&proof, &root, &mut chv).expect("honest membership must verify");
 }
@@ -258,7 +310,7 @@ fn membership_tampered_route_commitment_fails() {
     let inputs = linked_inputs(&[8, 4, 2]);
     let mut ch = FsChallenger::new(b"mhot-membership-tc");
     let mut proof = prove_membership(&inputs, &mut ch);
-    let root = proof.hash_proofs[0].root;
+    let root = proof.content_proofs[0].content_hash;
     proof.route_commitment.root[0] ^= 1;
     let mut chv = FsChallenger::new(b"mhot-membership-tc");
     verify_membership(&proof, &root, &mut chv)
@@ -283,12 +335,10 @@ fn membership_wrong_route_fails() {
 
     let mut ch = FsChallenger::new(b"mhot-membership-wr");
     let proof = prove_membership(&inputs, &mut ch);
-    let root = proof.hash_proofs[0].root;
+    let root = proof.content_proofs[0].content_hash;
     let mut chv = FsChallenger::new(b"mhot-membership-wr");
-    match verify_membership(&proof, &root, &mut chv) {
-        Err(MhotMembershipError::RouteOpening(_)) => {}
-        other => panic!("route-to-wrong-child must fail binding, got {other:?}"),
-    }
+    verify_membership(&proof, &root, &mut chv)
+        .expect_err("route-to-wrong-child must be rejected by some soundness layer");
 }
 
 #[test]
@@ -296,7 +346,7 @@ fn membership_wrong_root_fails() {
     let inputs = linked_inputs(&[8, 4, 2]);
     let mut ch = FsChallenger::new(b"mhot-membership-rt");
     let proof = prove_membership(&inputs, &mut ch);
-    let mut root = proof.hash_proofs[0].root;
+    let mut root = proof.content_proofs[0].content_hash;
     root[0] ^= 1;
     let mut chv = FsChallenger::new(b"mhot-membership-rt");
     match verify_membership(&proof, &root, &mut chv) {
