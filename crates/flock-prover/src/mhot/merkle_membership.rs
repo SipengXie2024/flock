@@ -36,6 +36,7 @@ pub enum MhotMembershipError {
 }
 
 /// Proof for a single MHOT node's in-node binary Merkle path.
+#[derive(serde::Serialize)]
 pub struct NodeMerkleProof {
     pub proof: MerklePathProof,
     pub commitment: Commitment,
@@ -288,6 +289,7 @@ impl MhotMembershipInput {
 }
 
 /// Per-node content hash chain proof.
+#[derive(serde::Serialize)]
 pub struct ContentChainProof {
     pub proof: ChainProofLigerito,
     pub commitment: Commitment,

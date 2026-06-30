@@ -2,103 +2,98 @@ use std::time::Instant;
 
 use flock_core::challenger::FsChallenger;
 use flock_prover::mhot::{
-    merkle_membership::{compute_content_hash, ContentMeta, MhotMembershipInput},
+    merkle_membership::{ContentMeta, MhotMembershipInput, mhot_node_to_route_witness},
     native_witness::MhotNodeWitness,
     sound_multiproof::{prove_sound_multiproof, verify_sound_multiproof},
 };
+use serde::Deserialize;
 
-fn synthetic_content(nc: usize) -> ContentMeta {
-    ContentMeta {
-        extraction_masks: [0x1F; 4],
-        sparse_partial_keys: vec![0; nc],
-        child_leaf_counts: vec![1; nc],
-    }
+#[derive(Deserialize)]
+struct NodeData {
+    children: Vec<Vec<u8>>,
+    selected_child: usize,
+    extraction_masks: [u64; 4],
+    sparse_partial_keys: Vec<u32>,
+    child_leaf_counts: Vec<u32>,
 }
 
-fn words_to_bytes(w: &[u32; 8]) -> [u8; 32] {
-    let mut h = [0u8; 32];
-    for i in 0..8 {
-        h[4 * i..4 * i + 4].copy_from_slice(&w[i].to_be_bytes());
-    }
-    h
+#[derive(Deserialize)]
+struct PathData {
+    nodes: Vec<NodeData>,
 }
 
-fn node_content_hash_bytes(node: &MhotNodeWitness, content: &ContentMeta) -> [u8; 32] {
-    use flock_prover::mhot::native_witness::mhot_node_to_sha256_merkle;
-    let w = mhot_node_to_sha256_merkle(node);
-    let merkle_root = words_to_bytes(&w.native_root);
-    compute_content_hash(content, &merkle_root)
+#[derive(Deserialize)]
+struct ExportData {
+    paths: Vec<PathData>,
+    native_single_proof_total_bytes: usize,
+    native_multi_proof_bytes: usize,
+    native_verify_seq_ms: f64,
+    native_verify_par_ms: f64,
+    native_verify_multi_ms: f64,
 }
 
-fn linked_inputs(fanouts: &[usize]) -> Vec<MhotMembershipInput> {
-    let depth = fanouts.len();
-    let mut inputs_rev = Vec::with_capacity(depth);
+fn node_data_to_input(nd: &NodeData) -> MhotMembershipInput {
+    let children: Vec<[u8; 32]> = nd.children.iter().map(|c| {
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(c);
+        arr
+    }).collect();
 
-    let leaf_children: Vec<[u8; 32]> = (0..fanouts[depth - 1])
-        .map(|i| {
-            let mut h = [0u8; 32];
-            h[0] = i as u8;
-            h[1] = 0xAA;
-            h
-        })
-        .collect();
-    let leaf_node = MhotNodeWitness {
-        children: leaf_children,
-        selected_child: 0,
+    let node = MhotNodeWitness {
+        children,
+        selected_child: nd.selected_child,
     };
-    let leaf_content = synthetic_content(leaf_node.children.len());
-    let mut child_content_hash = node_content_hash_bytes(&leaf_node, &leaf_content);
-    inputs_rev.push(MhotMembershipInput::from_node(leaf_node));
-
-    for level in (0..depth - 1).rev() {
-        let fanout = fanouts[level];
-        let selected = 1.min(fanout - 1);
-        let mut children: Vec<[u8; 32]> = (0..fanout)
-            .map(|i| {
-                let mut h = [0u8; 32];
-                h[0] = (level * 31 + i * 17) as u8;
-                h[1] = level as u8;
-                h
-            })
-            .collect();
-        children[selected] = child_content_hash;
-        let node = MhotNodeWitness { children, selected_child: selected };
-        let content = synthetic_content(node.children.len());
-        child_content_hash = node_content_hash_bytes(&node, &content);
-        inputs_rev.push(MhotMembershipInput::from_node(node));
-    }
-    inputs_rev.reverse();
-    inputs_rev
+    let route_witness = mhot_node_to_route_witness(&node);
+    let content = ContentMeta {
+        extraction_masks: nd.extraction_masks,
+        sparse_partial_keys: nd.sparse_partial_keys.clone(),
+        child_leaf_counts: nd.child_leaf_counts.clone(),
+    };
+    MhotMembershipInput { node, route_witness, content }
 }
 
 #[test]
-fn sound_membership_benchmark() {
-    let fanouts = &[8, 4, 2];
+fn sound_vs_native_benchmark() {
     eprintln!();
-    eprintln!("=== Sound MHOT Membership Benchmark ===");
-    eprintln!("{:>8} {:>12} {:>12} {:>12} {:>12} {:>10}",
-        "n_paths", "prove_ms", "verify_ms", "total_ms", "per_path", "unique");
-    eprintln!("{}", "-".repeat(72));
+    eprintln!("=== MHOT Membership Proof: Native vs Flock Sound (1M-key SHA-256 tree) ===");
+    eprintln!("{:>6} {:>10} {:>10} {:>8} {:>10} {:>10} {:>10} {:>8}",
+        "N", "native_KB", "flock_KB", "ratio", "nv_ms", "fp_ms", "fv_ms", "unique");
+    eprintln!("{}", "-".repeat(80));
 
-    for &n_paths in &[1, 4, 16] {
-        let path = linked_inputs(fanouts);
-        let paths: Vec<Vec<MhotMembershipInput>> =
-            (0..n_paths).map(|_| path.clone()).collect();
+    for &n in &[1, 16, 256] {
+        let filename = format!("/tmp/mhot_export_n{}.json", n);
+        let json = match std::fs::read_to_string(&filename) {
+            Ok(j) => j,
+            Err(_) => {
+                eprintln!("{:>6}  (skipped — {} not found, run persistent-hot export first)", n, filename);
+                continue;
+            }
+        };
+        let data: ExportData = serde_json::from_str(&json).unwrap();
 
-        let mut ch = FsChallenger::new(b"sound-bench");
+        let paths: Vec<Vec<MhotMembershipInput>> = data.paths.iter()
+            .map(|p| p.nodes.iter().map(node_data_to_input).collect())
+            .collect();
+
+        let mut ch = FsChallenger::new(b"sound-vs-native");
         let t0 = Instant::now();
         let proof = prove_sound_multiproof(&paths, &mut ch);
         let prove_ms = t0.elapsed().as_secs_f64() * 1e3;
 
         let root = proof.content_proofs[proof.path_mapping.node_indices[0][0]].content_hash;
-        let mut chv = FsChallenger::new(b"sound-bench");
+        let mut chv = FsChallenger::new(b"sound-vs-native");
         let t1 = Instant::now();
         verify_sound_multiproof(&proof, &root, &mut chv).expect("must verify");
         let verify_ms = t1.elapsed().as_secs_f64() * 1e3;
 
-        let total = prove_ms + verify_ms;
+        let flock_bytes = proof.proof_size_bytes();
+        let native_kb = data.native_single_proof_total_bytes as f64 / 1024.0;
+        let flock_kb = flock_bytes as f64 / 1024.0;
+        let ratio = native_kb / flock_kb;
         let unique = proof.hash_proofs.len();
-        eprintln!("{:>8} {:>12.1} {:>12.1} {:>12.1} {:>11.3} {:>10}",
-            n_paths, prove_ms, verify_ms, total, total / n_paths as f64, unique);
+
+        eprintln!("{:>6} {:>10.1} {:>10.1} {:>7.1}x {:>10.2} {:>10.1} {:>10.1} {:>8}",
+            n, native_kb, flock_kb, ratio,
+            data.native_verify_seq_ms, prove_ms, verify_ms, unique);
     }
 }

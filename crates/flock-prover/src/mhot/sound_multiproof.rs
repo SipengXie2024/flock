@@ -20,10 +20,12 @@ use super::merkle_membership::{
 use super::multiproof::{open_core_ligerito, verify_core_opening_ligerito};
 use super::route_f32::{self as route, RouteF32Setup};
 
+#[derive(serde::Serialize)]
 pub struct PathMapping {
     pub node_indices: Vec<Vec<usize>>,
 }
 
+#[derive(serde::Serialize)]
 pub struct SoundMultiproof {
     pub hash_proofs: Vec<NodeMerkleProof>,
     pub content_proofs: Vec<ContentChainProof>,
@@ -37,6 +39,12 @@ pub struct SoundMultiproof {
     pub n_paths: usize,
     pub path_depths: Vec<usize>,
     pub path_mapping: PathMapping,
+}
+
+impl SoundMultiproof {
+    pub fn proof_size_bytes(&self) -> usize {
+        bincode::serialized_size(self).unwrap_or(0) as usize
+    }
 }
 
 fn node_identity(input: &MhotMembershipInput) -> Vec<u8> {
