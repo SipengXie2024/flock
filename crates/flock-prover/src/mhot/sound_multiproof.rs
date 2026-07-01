@@ -9,6 +9,14 @@ fn vmrss_mb() -> f64 {
         .unwrap_or(0.0) / 1024.0
 }
 
+fn bytes_to_words(b: &[u8; 32]) -> [u32; 8] {
+    let mut w = [0u32; 8];
+    for i in 0..8 {
+        w[i] = u32::from_be_bytes([b[4 * i], b[4 * i + 1], b[4 * i + 2], b[4 * i + 3]]);
+    }
+    w
+}
+
 use crate::chain::{ChainShiftProof, prove_chain_shift, verify_chain_shift};
 use crate::merkle_path::{MerklePathShiftProof, prove_merkle_path_shift, verify_merkle_path_shift};
 use crate::prover::prove_fast_core_with_block_count;
@@ -33,9 +41,10 @@ use flock_core::pcs::{
 use flock_core::zerocheck::ZerocheckProof;
 
 use super::merkle_membership::{
-    MhotMembershipError, MhotMembershipInput, SOF_PACKED_BASE,
-    build_content_hash_chain, digest_to_sof_f128,
-    leaf_words_to_digest_bytes, pad_to_needed, pd_point, route_sof_f128,
+    ContentMeta, MhotMembershipError, MhotMembershipInput, SOF_PACKED_BASE,
+    build_content_hash_chain, compute_content_hash, digest_to_slot_f128, digest_to_sof_f128,
+    leaf_words_to_digest_bytes, merkle_slot_pd_point, pad_to_needed, pd_point,
+    recompute_native_root, route_sof_f128,
 };
 use super::multiproof::{fork_pcs_challenger, open_core_ligerito, verify_core_opening_ligerito};
 use super::native_witness::mhot_node_to_sha256_merkle;
@@ -66,6 +75,12 @@ pub struct SoundMultiproof {
     pub merkle_roots: Vec<[u32; 8]>,
     pub merkle_native_roots: Vec<[u32; 8]>,
     pub merkle_b_bits: Vec<Vec<bool>>,
+    // Per-node authenticated in-node Merkle siblings (real depth), the true
+    // depth-0 side bit, and content metadata — the verifier recomputes the
+    // committed tree's native_root and binds it to content_hash (soundness).
+    pub merkle_siblings: Vec<Vec<[u32; 8]>>,
+    pub merkle_leaf_is_right: Vec<bool>,
+    pub content_metas: Vec<ContentMeta>,
 
     // Per-node chain shift proofs
     pub chain_shifts: Vec<ChainShiftProof>,
@@ -164,6 +179,19 @@ pub fn prove_sound_multiproof(
     paths: &[Vec<MhotMembershipInput>],
     challenger: &mut FsChallenger,
 ) -> SoundMultiproof {
+    prove_sound_multiproof_impl(paths, &std::collections::HashMap::new(), challenger)
+}
+
+/// Implementation with a test-only seam: `chain_root_overrides` maps a
+/// unique-node index to a native_root substituted into that node's content-hash
+/// chain, decoupling it from the merkle base's authenticated tree. Empty in
+/// production; the forgery test uses it to exercise the merkle_root↔content_hash
+/// binding.
+pub(crate) fn prove_sound_multiproof_impl(
+    paths: &[Vec<MhotMembershipInput>],
+    chain_root_overrides: &std::collections::HashMap<usize, [u32; 8]>,
+    challenger: &mut FsChallenger,
+) -> SoundMultiproof {
     assert!(!paths.is_empty(), "need at least one path");
     for path in paths {
         assert!(!path.is_empty(), "each path must have at least one node");
@@ -199,18 +227,49 @@ pub fn prove_sound_multiproof(
     let mut chain_data: Vec<(Vec<Compression>, [u32; 8], [u32; 8], usize)> = Vec::with_capacity(u);
     let mut merkle_block_counts: Vec<usize> = Vec::with_capacity(u);
     let mut chain_block_counts: Vec<usize> = Vec::with_capacity(u);
+    let mut merkle_siblings: Vec<Vec<[u32; 8]>> = Vec::with_capacity(u);
+    let mut merkle_sib_slots: Vec<Vec<usize>> = Vec::with_capacity(u);
 
-    for input in &unique_nodes {
+    for (node_idx, input) in unique_nodes.iter().enumerate() {
         let w = mhot_node_to_sha256_merkle(&input.node);
         let n_real_merkle = w.compressions.len();
         let mut compressions = w.compressions;
         let mut b_bits = w.b_bits.clone();
         let needed = 1usize << min_n_blocks_log(n_real_merkle);
         let padded_root = pad_to_needed(&mut compressions, &mut b_bits, needed);
+
+        // Per-level siblings (values + committed slots) for the verifier's
+        // native_root recompute. Only the real depth carries siblings; the
+        // padding blocks are zero-sibling.
+        let selected = input.node.selected_child;
+        let mut node_sibs: Vec<[u32; 8]> = Vec::with_capacity(n_real_merkle);
+        let mut node_slots: Vec<usize> = Vec::with_capacity(n_real_merkle);
+        for d in 0..n_real_merkle {
+            let m = &compressions[d].1;
+            let real_side = (selected >> d) & 1 == 1;
+            // Sibling is in X_R (m[8..16]) at d=0 (leaf forced left) and whenever
+            // the real side is left; in X_L (m[0..8]) when the real side is right.
+            let (src, slot): (&[u32], usize) = if d == 0 || !real_side {
+                (&m[8..16], MERKLE_LAYOUT.x_r_slot as usize)
+            } else {
+                (&m[0..8], MERKLE_LAYOUT.x_l_slot as usize)
+            };
+            let mut sib = [0u32; 8];
+            sib.copy_from_slice(src);
+            node_sibs.push(sib);
+            node_slots.push(slot);
+        }
+        merkle_siblings.push(node_sibs);
+        merkle_sib_slots.push(node_slots);
+
         merkle_data.push((compressions, b_bits, w.leaf, padded_root, w.native_root));
         merkle_block_counts.push(needed);
 
-        let merkle_root_bytes = leaf_words_to_digest_bytes(&w.native_root);
+        let chain_native_root = chain_root_overrides
+            .get(&node_idx)
+            .copied()
+            .unwrap_or(w.native_root);
+        let merkle_root_bytes = leaf_words_to_digest_bytes(&chain_native_root);
         let (chain_comps, content_hash, cv_last, n_real) =
             build_content_hash_chain(&input.content, &merkle_root_bytes);
         chain_data.push((chain_comps.clone(), content_hash, cv_last, n_real));
@@ -272,6 +331,21 @@ pub fn prove_sound_multiproof(
         );
         merkle_shifts.push(shift_proof);
         merkle_pd_claims.push(pd);
+
+        // Sibling PD claims: pin each committed sibling slot to its claimed value
+        // so the verifier's native_root recompute uses authenticated siblings.
+        let block_base = merkle_alloc.offsets[i];
+        for (d, (sib, &slot)) in
+            merkle_siblings[i].iter().zip(merkle_sib_slots[i].iter()).enumerate()
+        {
+            let vals = digest_to_slot_f128(sib);
+            for within in 0..2 {
+                let point =
+                    merkle_slot_pd_point(merkle_setup.r1cs.m, block_base + d, slot, within);
+                let eq_ind = pcs::DirectEqInd::Sparse(pcs::ring_switch::build_eq_sparse(&point));
+                merkle_pd_claims.push(PackedDirectClaim { point, value: vals[within], eq_ind });
+            }
+        }
     }
 
     let mut merkle_pcs_ch = fork_pcs_challenger(challenger, b"merkle");
@@ -379,6 +453,11 @@ pub fn prove_sound_multiproof(
         merkle_roots: (0..u).map(|i| merkle_data[i].3).collect(),
         merkle_native_roots: (0..u).map(|i| merkle_data[i].4).collect(),
         merkle_b_bits: (0..u).map(|i| merkle_data[i].1.clone()).collect(),
+        merkle_siblings,
+        merkle_leaf_is_right: (0..u)
+            .map(|i| unique_nodes[i].node.selected_child & 1 == 1)
+            .collect(),
+        content_metas: (0..u).map(|i| unique_nodes[i].content.clone()).collect(),
 
         chain_shifts,
         chain_content_hashes: (0..u).map(|i| chain_data[i].1).collect(),
@@ -410,7 +489,13 @@ pub fn verify_sound_multiproof(
     challenger: &mut FsChallenger,
 ) -> Result<(), MhotMembershipError> {
     let u = proof.merkle_shifts.len();
-    if u == 0 || u != proof.chain_shifts.len() {
+    if u == 0
+        || u != proof.chain_shifts.len()
+        || u != proof.merkle_siblings.len()
+        || u != proof.merkle_leaf_is_right.len()
+        || u != proof.content_metas.len()
+        || u != proof.merkle_b_bits.len()
+    {
         return Err(MhotMembershipError::RootMismatch {
             expected: *expected_root,
             actual: [0; 8],
@@ -460,6 +545,24 @@ pub fn verify_sound_multiproof(
             proof.n_log_merkle,
         );
         merkle_pd_refs_data.push((point, claims.value));
+
+        // Sibling PD refs (must mirror the prover's per-node claim order). A wrong
+        // slot (from a bad b_bit) opens a different committed value → PCS rejects.
+        let block_base = proof.merkle_block_offsets[i];
+        for (d, sib) in proof.merkle_siblings[i].iter().enumerate() {
+            let is_right = proof.merkle_b_bits[i].get(d).copied().unwrap_or(false);
+            let slot = if d == 0 || !is_right {
+                MERKLE_LAYOUT.x_r_slot as usize
+            } else {
+                MERKLE_LAYOUT.x_l_slot as usize
+            };
+            let vals = digest_to_slot_f128(sib);
+            for within in 0..2 {
+                let point =
+                    merkle_slot_pd_point(merkle_setup.r1cs.m, block_base + d, slot, within);
+                merkle_pd_refs_data.push((point, vals[within]));
+            }
+        }
     }
 
     let t2 = std::time::Instant::now();
@@ -473,6 +576,33 @@ pub fn verify_sound_multiproof(
         &proof.merkle_commitment, &proof.merkle_pcs,
         &merkle_ab, &merkle_c, &merkle_pd_refs, &mut merkle_pcs_ch,
     ).map_err(MhotMembershipError::NodeVerify2)?;
+
+    // -- Bind committed merkle tree ↔ content_hash: recompute each node's true
+    //    native_root from its now-authenticated siblings and check content_hash
+    //    was actually built over that root. Closes the forgery where a fake
+    //    in-node tree is authenticated while content_hash commits a different
+    //    (real) root — the two were never compared before. --
+    for i in 0..u {
+        let siblings = &proof.merkle_siblings[i];
+        let depth = siblings.len();
+        let mut sides: Vec<bool> = Vec::with_capacity(depth);
+        for d in 0..depth {
+            let side = if d == 0 {
+                proof.merkle_leaf_is_right[i]
+            } else {
+                proof.merkle_b_bits[i].get(d).copied().unwrap_or(false)
+            };
+            sides.push(side);
+        }
+        let recomputed = recompute_native_root(&proof.merkle_leaves[i], siblings, &sides);
+        let expected_ch = compute_content_hash(
+            &proof.content_metas[i],
+            &leaf_words_to_digest_bytes(&recomputed),
+        );
+        if bytes_to_words(&expected_ch) != proof.chain_content_hashes[i] {
+            return Err(MhotMembershipError::NativeRootMismatch { node_idx: i });
+        }
+    }
 
     let t3 = std::time::Instant::now();
     // -- Verify chain core --
@@ -619,4 +749,66 @@ pub fn verify_sound_multiproof(
             ms(t1-t0), ms(t2-t1), ms(t3-t2), ms(t4-t3), ms(t5-t4), ms(t6-t5), ms(t6.duration_since(t5)), ms(t7-t6), ms(t7-t0));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod forgery_tests {
+    use super::{prove_sound_multiproof_impl, verify_sound_multiproof};
+    use crate::mhot::merkle_membership::MhotMembershipInput;
+    use crate::mhot::native_witness::{mhot_node_to_sha256_merkle, MhotNodeWitness};
+    use flock_core::challenger::FsChallenger;
+    use std::collections::HashMap;
+
+    /// Forgery: a malicious prover runs the merkle pass on a FAKE in-node tree
+    /// whose selected child is a non-member `L`, but runs the content-hash chain
+    /// on the REAL tree root (so content_hash matches what the root/parent demands).
+    /// The merkle base honestly authenticates `L → fake_root`; the chain commits
+    /// the real root; nothing compares the two → a non-member is accepted.
+    ///
+    /// Standard TDD red: asserts the forgery is REJECTED. Today verify returns Ok
+    /// (the bug) so this FAILS (red). After the fix the verifier recomputes the
+    /// committed tree's native_root and rejects → this PASSES (green).
+    #[test]
+    fn forged_fake_merkle_real_root_rejected() {
+        // Real node with genuine children.
+        let real_children: Vec<[u8; 32]> = (0..8)
+            .map(|i| {
+                let mut h = [0u8; 32];
+                h[0] = i as u8;
+                h[1] = 0xAA;
+                h
+            })
+            .collect();
+        let selected = 3usize;
+        let real_node = MhotNodeWitness {
+            children: real_children.clone(),
+            selected_child: selected,
+        };
+        let r_real = mhot_node_to_sha256_merkle(&real_node).native_root;
+
+        // Fake node: same shape, but the selected child is a non-member L.
+        let mut fake_children = real_children;
+        fake_children[selected] = [0xEE; 32];
+        let fake_node = MhotNodeWitness {
+            children: fake_children,
+            selected_child: selected,
+        };
+
+        // Prove: merkle pass on the FAKE tree, chain pass overridden to the REAL root.
+        let input = MhotMembershipInput::from_node(fake_node);
+        let overrides = HashMap::from([(0usize, r_real)]);
+        let mut ch = FsChallenger::new(b"smp-forge");
+        let proof = prove_sound_multiproof_impl(&[vec![input]], &overrides, &mut ch);
+
+        // Public root = content_hash over the REAL root (self-consistent, as an
+        // honest parent would store it).
+        let root = proof.chain_content_hashes[0];
+        let mut chv = FsChallenger::new(b"smp-forge");
+        let res = verify_sound_multiproof(&proof, &root, &mut chv);
+        assert!(
+            res.is_err(),
+            "forgery (fake merkle tree + real content_hash root) must be REJECTED; \
+             today it is accepted (the soundness bug). got {res:?}"
+        );
+    }
 }

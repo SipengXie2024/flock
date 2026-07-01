@@ -124,6 +124,9 @@ fn sound_multiproof_tampered_content_hash() {
     match verify_sound_multiproof(&proof, &root, &mut chv) {
         Err(MhotMembershipError::ContentHashMismatch { .. }) => {}
         Err(MhotMembershipError::CrossNodeBinding { .. }) => {}
+        // The merkle_root↔content_hash binding recompute now trips first: the
+        // tampered content_hash no longer matches SHA256(meta ‖ recomputed_root).
+        Err(MhotMembershipError::NativeRootMismatch { .. }) => {}
         other => panic!("tampered content_hash must be rejected, got {other:?}"),
     }
 }
