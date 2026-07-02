@@ -274,16 +274,14 @@ pub fn prove_merkle_path_shift<Ch: Challenger>(
         }
     }
     let mut t_eq = eq_tau.clone();
+    // B(i_p·L) (the leaf row of each path) is the REAL depth-0 side bit: the W
+    // formula routes the leaf term (added at row 0 of t_shift_alpha) to X_L when
+    // B=0 and X_R when B=1, so the shift authenticates a tree built in true
+    // left/right order (native_root), not a left-forced flock_root.
     let mut t_b: Vec<F128> = b_bits
         .iter()
         .map(|&b| if b { F128::ONE } else { F128::ZERO })
         .collect();
-    // First row of every path has B := 0 by convention (the path's leaf goes
-    // into the in_L slot of its first hash). For path_log=0 this is just
-    // B(0) := 0 — the single-path convention.
-    for i_p in 0..n_paths {
-        t_b[i_p << pos_log] = F128::ZERO;
-    }
 
     // Per-slot g tables (length 2^n each). Folded independently through y rounds.
     let mut g_z = z_vals.to_vec();
@@ -551,13 +549,9 @@ pub fn verify_merkle_path_shift<Ch: Challenger>(
         .fold(F128::ONE, |acc, t| acc * (F128::ONE + t));
     let t_shift_alpha = eq_taup_tauyp * (shift_q + alpha * eq_tauyq_zero);
     let t_eq = eq_eval(&tau, &instance_point);
-    // B(τ_y) — naive O(N). Apply the per-path B-convention (first row of every
-    // path forced to 0) to mirror the prover.
-    let mut b_local = b_bits.to_vec();
-    for i_p in 0..n_paths {
-        b_local[i_p << pos_log] = false;
-    }
-    let t_b = eval_bit_mle(&b_local, &instance_point);
+    // B(τ_y) — naive O(N). The leaf row's B is the real depth-0 side bit (no
+    // forced-0 convention), mirroring the prover.
+    let t_b = eval_bit_mle(b_bits, &instance_point);
     let one_plus_t_b = F128::ONE + t_b;
 
     let w_z_contrib = slot_indicator(layout.z_slot, sel_slot, side) * t_eq;
@@ -658,11 +652,74 @@ mod tests {
         (x_l, x_r, z_vals, iv, b_bits, leaf, root)
     }
 
+    /// Like `build_honest_scenario` but the depth-0 leaf is placed per the real
+    /// side bit `b0`: with `b0=true` the leaf is the RIGHT child at depth 0
+    /// (Sel(0) = X_R(0)), exercising the removed forced-B(0)=0 convention.
+    fn build_honest_scenario_b0(
+        n: usize,
+        seed: u64,
+        b0: bool,
+    ) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<F128>, Vec<bool>, F128, F128) {
+        let mut rng = Rng::new(seed);
+        let k = 1usize << n;
+        let z_vals: Vec<F128> = (0..k).map(|_| rng.f128()).collect();
+        let mut b_bits = vec![false; k];
+        b_bits[0] = b0;
+        for i in 1..k {
+            b_bits[i] = rng.bit();
+        }
+        let mut x_l = vec![F128::ZERO; k];
+        let mut x_r = vec![F128::ZERO; k];
+        let leaf = rng.f128();
+        let sibling0 = rng.f128();
+        // Sel(0) = leaf, placed in the slot selected by b_bits[0].
+        if b0 {
+            x_r[0] = leaf;
+            x_l[0] = sibling0;
+        } else {
+            x_l[0] = leaf;
+            x_r[0] = sibling0;
+        }
+        for i in 1..k {
+            if !b_bits[i] {
+                x_l[i] = z_vals[i - 1];
+                x_r[i] = rng.f128();
+            } else {
+                x_r[i] = z_vals[i - 1];
+                x_l[i] = rng.f128();
+            }
+        }
+        let iv: Vec<F128> = (0..k).map(|_| rng.f128()).collect();
+        let root = z_vals[k - 1];
+        (x_l, x_r, z_vals, iv, b_bits, leaf, root)
+    }
+
     fn canonical_layout() -> SlotLayout {
         SlotLayout {
             z_slot: 0,
             x_l_slot: 1,
             x_r_slot: 2,
+        }
+    }
+
+    /// Route-2: with the forced-B(0)=0 convention removed, the shift must
+    /// authenticate a tree whose depth-0 leaf is a RIGHT child (b_bits[0]=true).
+    #[test]
+    fn honest_roundtrip_real_b0_accepts() {
+        for &n in &[3usize, 4, 5] {
+            for b0 in [false, true] {
+                let (x_l, x_r, z, iv, b, leaf, root) =
+                    build_honest_scenario_b0(n, 0xB0 + n as u64 + (b0 as u64) * 999, b0);
+                let layout = canonical_layout();
+                let mut ch_p = FsChallenger::new(b"merkle-test-v0");
+                let (proof, claims_p) =
+                    prove_merkle_path_shift(0, &x_l, &x_r, &z, &iv, &b, layout, &mut ch_p);
+                let mut ch_v = FsChallenger::new(b"merkle-test-v0");
+                let claims_v =
+                    verify_merkle_path_shift(0, &proof, &[leaf], root, &b, n, layout, &mut ch_v)
+                        .unwrap_or_else(|e| panic!("verify rejected honest b0={b0} proof: {e:?}"));
+                assert_eq!(claims_v, claims_p, "claims must match at n={n} b0={b0}");
+            }
         }
     }
 
