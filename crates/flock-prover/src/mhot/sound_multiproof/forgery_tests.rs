@@ -11,7 +11,7 @@
 
     /// The public root = content_hash of a node = SHA-256(content ‖ native_root).
     fn node_root(input: &MhotMembershipInput) -> [u32; 8] {
-        let native = mhot_node_to_sha256_merkle(&input.node).native_root;
+        let native = mhot_node_to_sha256_merkle(&input.node, false).native_root;
         bytes_to_words(&compute_content_hash(
             &input.content,
             &leaf_words_to_digest_bytes(&native),
@@ -36,7 +36,7 @@
             sparse_partial_keys: vec![0, 1],
             child_leaf_counts: vec![1, 1],
         };
-        let t_root = mhot_node_to_sha256_merkle(&t_node).native_root;
+        let t_root = mhot_node_to_sha256_merkle(&t_node, false).native_root;
         let t_ch = compute_content_hash(&t_meta, &leaf_words_to_digest_bytes(&t_root));
 
         // Root node R: masks[0]=0b10 → dense(key)=0 (key bit 1 clear); sparse
@@ -119,7 +119,7 @@
             sparse_partial_keys: vec![0xDEAD, 0],
             child_leaf_counts: vec![1, 2],
         };
-        let m_root = mhot_node_to_sha256_merkle(&m_node).native_root;
+        let m_root = mhot_node_to_sha256_merkle(&m_node, false).native_root;
         let m_ch = compute_content_hash(&m_meta, &leaf_words_to_digest_bytes(&m_root));
 
         // Root R selects child 0 = M. dense 0; sparse[0]=0 ⇒ selects 0.
@@ -274,5 +274,126 @@
             matches!(res, Err(MhotMembershipError::RootMismatch { .. })),
             "fake in-node tree under the real tree's root must be REJECTED (verifier \
              computes content_hash over the committed fake tree); got {res:?}"
+        );
+    }
+
+    fn two_child_input(selected: usize) -> MhotMembershipInput {
+        let node = MhotNodeWitness {
+            children: vec![[0x11; 32], [0x22; 32]],
+            selected_child: selected,
+        };
+        MhotMembershipInput::from_node(node)
+    }
+
+    /// Route-2 positive: b_bits[0] is now the REAL depth-0 side bit (native-order
+    /// chains), so a right-child-at-depth-0 selected leaf must authenticate
+    /// end-to-end — production never exercised real b0 before this.
+    #[test]
+    fn b0_right_child_honest_accepts() {
+        for selected in [0usize, 1] {
+            let input = two_child_input(selected);
+            let root = node_root(&input);
+            let mut ch = FsChallenger::new(b"smp-b0");
+            let proof = prove_sound_multiproof(&[vec![input]], &mut ch);
+            assert_eq!(
+                proof.merkle_b_bits[0][0],
+                selected == 1,
+                "depth-0 side bit must be the real side (selected={selected})"
+            );
+            let mut chv = FsChallenger::new(b"smp-b0");
+            verify_sound_multiproof(&proof, &root, &mut chv)
+                .unwrap_or_else(|e| panic!("honest selected={selected} must verify: {e:?}"));
+        }
+    }
+
+    /// Route-2 soundness delta: the public depth-0 side bit is consumed by the
+    /// merkle shift (tree order — the W formula routes the leaf term to X_L/X_R
+    /// per B(0)) and by selected_index (entry routing position). Flipping it
+    /// post-prove must be rejected: the shift's authenticated chain no longer
+    /// matches the committed compressions.
+    ///
+    /// The "rebuild a consistent fake tree for the flipped bit" variant of this
+    /// attack is a different committed tree (the leaf sits at the other index),
+    /// so its native_root — and hence its verifier-computed content_hash —
+    /// differs from the honest one and the public-root check rejects; that is
+    /// exactly `forged_fake_merkle_real_root_rejected`.
+    #[test]
+    fn b0_flip_rejected() {
+        for selected in [0usize, 1] {
+            let input = two_child_input(selected);
+            let root = node_root(&input);
+            let mut ch = FsChallenger::new(b"smp-b0-flip");
+            let mut proof = prove_sound_multiproof(&[vec![input]], &mut ch);
+            proof.merkle_b_bits[0][0] = !proof.merkle_b_bits[0][0];
+            let mut chv = FsChallenger::new(b"smp-b0-flip");
+            let res = verify_sound_multiproof(&proof, &root, &mut chv);
+            assert!(
+                res.is_err(),
+                "flipped depth-0 side bit must be rejected (selected={selected}), got Ok"
+            );
+        }
+    }
+
+    /// The Route-2 decoupling attack: commit a FAKE in-node tree (whose selected
+    /// leaf is a non-member, honestly shift-authenticated) but supply the REAL
+    /// tree's native_root, so the verifier-computed content_hash hits the real
+    /// public root and the root check passes on genuine values. The pad-forward
+    /// check is the ONLY thing standing between this forgery and acceptance:
+    /// pad-forwarding the real native_root cannot reach the fake chain's
+    /// shift-authenticated padded root (SHA-256 collision resistance).
+    #[test]
+    fn forged_native_root_decoupling_rejected() {
+        let real_children: Vec<[u8; 32]> = (0..8)
+            .map(|i| {
+                let mut h = [0u8; 32];
+                h[0] = i as u8;
+                h[1] = 0xBB;
+                h
+            })
+            .collect();
+        let selected = 3usize;
+        let real_node = MhotNodeWitness {
+            children: real_children.clone(),
+            selected_child: selected,
+        };
+        let real_input = MhotMembershipInput::from_node(real_node);
+        let real_root = node_root(&real_input);
+        let real_native =
+            mhot_node_to_sha256_merkle(&real_input.node, false).native_root;
+
+        let mut fake_children = real_children;
+        fake_children[selected] = [0xEE; 32];
+        let fake_node = MhotNodeWitness {
+            children: fake_children,
+            selected_child: selected,
+        };
+        let fake_input = MhotMembershipInput::from_node(fake_node);
+
+        let mut ch = FsChallenger::new(b"smp-nr-decouple");
+        let mut proof = prove_sound_multiproof(&[vec![fake_input]], &mut ch);
+        proof.merkle_native_roots[0] = real_native;
+        let mut chv = FsChallenger::new(b"smp-nr-decouple");
+        let res = verify_sound_multiproof(&proof, &real_root, &mut chv);
+        assert!(
+            matches!(res, Err(MhotMembershipError::NativeRootMismatch { node_idx: 0 })),
+            "fake tree + real native_root must fail the pad-forward check, got {res:?}"
+        );
+    }
+
+    /// The pad-forward binding: merkle_native_roots[i] is prover-supplied and
+    /// only trustworthy because padding it forward n_pad times must reach the
+    /// shift-authenticated merkle_roots[i]. Tampering it must fail exactly there.
+    #[test]
+    fn tampered_native_root_rejected() {
+        let input = two_child_input(1);
+        let root = node_root(&input);
+        let mut ch = FsChallenger::new(b"smp-nr-tamper");
+        let mut proof = prove_sound_multiproof(&[vec![input]], &mut ch);
+        proof.merkle_native_roots[0][0] ^= 1;
+        let mut chv = FsChallenger::new(b"smp-nr-tamper");
+        let res = verify_sound_multiproof(&proof, &root, &mut chv);
+        assert!(
+            matches!(res, Err(MhotMembershipError::NativeRootMismatch { node_idx: 0 })),
+            "tampered native_root must fail the pad-forward check, got {res:?}"
         );
     }

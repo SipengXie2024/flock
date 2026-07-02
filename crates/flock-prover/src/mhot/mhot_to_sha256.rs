@@ -214,7 +214,7 @@ mod tests {
                 children: children.clone(),
                 selected_child: 0,
             };
-            let witness = mhot_node_to_sha256_merkle(&node);
+            let witness = mhot_node_to_sha256_merkle(&node, false);
             let cpu_root = cpu_merkle_root(&children);
 
             assert_eq!(
@@ -246,7 +246,7 @@ mod tests {
             children: children.clone(),
             selected_child: 0,
         };
-        let w = mhot_node_to_sha256_merkle(&node);
+        let w = mhot_node_to_sha256_merkle(&node, false);
 
         assert_eq!(w.compressions.len(), 1, "fanout 2 → depth 1 → 1 compression");
         assert!(!w.b_bits[0], "b_bits[0] must be false (Flock convention)");
@@ -264,7 +264,7 @@ mod tests {
             children: children.clone(),
             selected_child: 1,
         };
-        let wr = mhot_node_to_sha256_merkle(&node_r);
+        let wr = mhot_node_to_sha256_merkle(&node_r, false);
         assert_eq!(wr.compressions.len(), 1);
         assert!(!wr.b_bits[0], "b_bits[0] must be false even for right child");
         assert_eq!(wr.leaf, bytes_to_words_be(&children[1]));
@@ -284,7 +284,7 @@ mod tests {
             children: children.clone(),
             selected_child: 4,
         };
-        let w = mhot_node_to_sha256_merkle(&node);
+        let w = mhot_node_to_sha256_merkle(&node, false);
 
         assert_eq!(w.compressions.len(), 3, "fanout 5 padded to 8 → depth 3");
 

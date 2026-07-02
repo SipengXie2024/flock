@@ -100,7 +100,7 @@ fn sound_vs_native_benchmark() {
         // Public root = content_hash of the root node (verifier-recomputed;
         // chain_content_hashes was deleted).
         let root_node = &paths[0][0];
-        let root_native = mhot_node_to_sha256_merkle(&root_node.node).native_root;
+        let root_native = mhot_node_to_sha256_merkle(&root_node.node, false).native_root;
         let root_ch = compute_content_hash(&root_node.content, &words_to_bytes(&root_native));
         let mut root = [0u32; 8];
         for i in 0..8 {

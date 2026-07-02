@@ -3,7 +3,7 @@ use crate::r1cs_hashes::merkle_path_common::{
     MerklePathFold, build_merkle_claim_point_at_offset,
 };
 use crate::r1cs_hashes::sha2::{
-    MERKLE_LAYOUT, Sha256HybridSetup,
+    MERKLE_LAYOUT, SHA256_IV, Sha256HybridSetup, sha256_compress,
 };
 use flock_core::challenger::{Challenger, FsChallenger};
 use flock_core::field::F128;
@@ -14,8 +14,9 @@ use flock_core::pcs::{
 use flock_core::zerocheck::ZerocheckProof;
 
 use super::merkle_membership::{
-    ContentMeta, MhotMembershipError, PathEntry, SOF_PACKED_BASE, compute_content_hash, compute_dense_key, digest_to_slot_f128,
-    digest_to_sof_f128, leaf_content_hash, leaf_words_to_digest_bytes, merkle_slot_pd_point, pd_point, recompute_native_root, search_in_sparse_keys,
+    ContentMeta, MhotMembershipError, PathEntry, SOF_PACKED_BASE, compute_content_hash,
+    compute_dense_key, digest_to_sof_f128, leaf_content_hash, leaf_words_to_digest_bytes,
+    pd_point, search_in_sparse_keys,
 };
 use super::multiproof::{fork_pcs_challenger, verify_core_opening_ligerito};
 use super::route_f32::RouteF32Setup;
@@ -38,12 +39,13 @@ pub struct SoundMultiproof {
     pub merkle_leaves: Vec<[u32; 8]>,
     pub merkle_roots: Vec<[u32; 8]>,
     pub merkle_b_bits: Vec<Vec<bool>>,
-    // Per-node authenticated in-node Merkle siblings (real depth), the true
-    // depth-0 side bit, and content metadata — the verifier recomputes the
-    // committed tree's native_root and computes content_hash natively from it,
-    // binding it to the parent leaf / public root (no chain SNARK needed).
-    pub merkle_siblings: Vec<Vec<[u32; 8]>>,
-    pub merkle_leaf_is_right: Vec<bool>,
+    // Per-node real (pre-padding) in-node tree root. merkle_roots[i] is the
+    // PADDED chain root the shift authenticates (chains are padded to the
+    // block count); the verifier pad-forwards this value n_pad times, asserts
+    // it reaches merkle_roots[i] (which authenticates it), then computes
+    // content_hash natively over it — binding the committed tree to the
+    // parent leaf / public root (no siblings, no chain SNARK needed).
+    pub merkle_native_roots: Vec<[u32; 8]>,
     pub content_metas: Vec<ContentMeta>,
 
     // Block layout metadata (verifier needs these for PD claim assembly)
@@ -74,31 +76,36 @@ mod prove;
 pub use prove::prove_sound_multiproof;
 pub(crate) use prove::bytes_to_words;
 
-/// In-node binary-Merkle depth is `ceil(log2(fanout))`; fanout is capped at 32
-/// (native `dense_key` is `u32`), so depth never exceeds 5. Reject anything far
-/// beyond that so the `1 << d` / `1 << bit_pos` shifts below cannot overflow on
-/// a malformed proof.
-const MAX_INNODE_DEPTH: usize = 32;
+/// In-node binary tree depth from the authenticated fanout: `ceil(log2(fanout))`.
+/// The fanout ≤ 32 gate bounds this at 5, so the `1 << d` shifts below cannot
+/// overflow. NOT derivable from `b_bits.len()` (padded to the block count).
+#[inline]
+fn innode_depth(meta: &ContentMeta) -> usize {
+    meta.sparse_partial_keys.len().next_power_of_two().trailing_zeros() as usize
+}
 
-/// The true in-node side bit at depth `d` for node `i` (LSB-at-depth-0). Depth 0
-/// carries the real leaf side in `merkle_leaf_is_right` (the protocol forces
-/// `b_bits[0]=false`); deeper levels use the public `b_bits`. Single source of
-/// truth for the side-bit convention — the native_root recompute and the entry
-/// routing check both read it, so a convention change (e.g. Route 2) updates
-/// both at once.
+/// Upper bound on a node's merkle chain block count. Honest chains are always
+/// padded to 8 (fanout ≤ 32 ⇒ depth ≤ 5 ⇒ `min_n_blocks_log` floors at 8); 64
+/// leaves protocol headroom. The bound (with the power-of-two gate) keeps the
+/// pad-forward loop and `b_bits` resize bounded and makes the shift's
+/// `b_bits.len() == 1 << inst_log` assert unreachable on a malformed proof —
+/// verifier DoS hardening, latent while `SoundMultiproof` is Serialize-only.
+const MAX_MERKLE_BLOCKS: usize = 64;
+
+/// The true in-node side bit at depth `d` for node `i` (LSB-at-depth-0). Every
+/// depth including 0 carries the REAL side in the public `b_bits` (native-order
+/// chains; the forced-b0 convention is gone). Single source of truth for the
+/// side-bit convention — the pad-forward binding and the entry routing check
+/// both consume the same bits the merkle shift authenticated.
 #[inline]
 fn authenticated_side(proof: &SoundMultiproof, i: usize, d: usize) -> bool {
-    if d == 0 {
-        proof.merkle_leaf_is_right[i]
-    } else {
-        proof.merkle_b_bits[i].get(d).copied().unwrap_or(false)
-    }
+    proof.merkle_b_bits[i].get(d).copied().unwrap_or(false)
 }
 
 /// The authenticated selected-child index of node `i`, reconstructed from its
-/// side bits (the same bits whose recompute is pinned to `content_hash`).
+/// side bits (the same bits the shift consumed as the tree order).
 fn selected_index(proof: &SoundMultiproof, i: usize) -> usize {
-    let depth = proof.merkle_siblings[i].len();
+    let depth = innode_depth(&proof.content_metas[i]);
     (0..depth).fold(0usize, |acc, d| {
         acc | ((authenticated_side(proof, i, d) as usize) << d)
     })
@@ -122,8 +129,7 @@ pub fn verify_sound_multiproof(
     // short Vec must be rejected cleanly, not panic (verifier DoS hardening —
     // load-bearing once SoundMultiproof gains a Deserialize path).
     if u == 0
-        || u != proof.merkle_siblings.len()
-        || u != proof.merkle_leaf_is_right.len()
+        || u != proof.merkle_native_roots.len()
         || u != proof.content_metas.len()
         || u != proof.merkle_b_bits.len()
         || u != proof.merkle_block_counts.len()
@@ -139,10 +145,18 @@ pub fn verify_sound_multiproof(
     for i in 0..u {
         let meta = &proof.content_metas[i];
         let mask_bits: u32 = meta.extraction_masks.iter().map(|m| m.count_ones()).sum();
+        let fanout = meta.sparse_partial_keys.len();
+        // fanout ∈ [2, 32]: internal nodes always have ≥2 children (the prover
+        // asserts this) and native dense_key is u32. The upper gate bounds
+        // innode_depth at 5; the block-count gate keeps n_pad from underflowing
+        // in the pad-forward check below.
         if mask_bits > 32
-            || meta.sparse_partial_keys.len() != meta.child_leaf_counts.len()
-            || meta.sparse_partial_keys.len() > 32
-            || proof.merkle_siblings[i].len() > MAX_INNODE_DEPTH
+            || fanout != meta.child_leaf_counts.len()
+            || fanout < 2
+            || fanout > 32
+            || innode_depth(meta) > proof.merkle_block_counts[i]
+            || !proof.merkle_block_counts[i].is_power_of_two()
+            || proof.merkle_block_counts[i] > MAX_MERKLE_BLOCKS
         {
             return Err(MhotMembershipError::RootMismatch {
                 expected: *expected_root,
@@ -194,24 +208,6 @@ pub fn verify_sound_multiproof(
             proof.n_log_merkle,
         );
         merkle_pd_refs_data.push((point, claims.value));
-
-        // Sibling PD refs (must mirror the prover's per-node claim order). A wrong
-        // slot (from a bad b_bit) opens a different committed value → PCS rejects.
-        let block_base = proof.merkle_block_offsets[i];
-        for (d, sib) in proof.merkle_siblings[i].iter().enumerate() {
-            let is_right = proof.merkle_b_bits[i].get(d).copied().unwrap_or(false);
-            let slot = if d == 0 || !is_right {
-                MERKLE_LAYOUT.x_r_slot as usize
-            } else {
-                MERKLE_LAYOUT.x_l_slot as usize
-            };
-            let vals = digest_to_slot_f128(sib);
-            for within in 0..2 {
-                let point =
-                    merkle_slot_pd_point(merkle_setup.r1cs.m, block_base + d, slot, within);
-                merkle_pd_refs_data.push((point, vals[within]));
-            }
-        }
     }
 
     let t2 = std::time::Instant::now();
@@ -226,22 +222,31 @@ pub fn verify_sound_multiproof(
         &merkle_ab, &merkle_c, &merkle_pd_refs, &mut merkle_pcs_ch,
     ).map_err(MhotMembershipError::NodeVerify2)?;
 
-    // -- Node identity: recompute each node's content_hash natively from its
-    //    authenticated in-node tree (native_root from opened siblings) + the
-    //    content metadata. The verifier COMPUTES this rather than trusting a
-    //    prover-supplied value, so no separate SHA-256 chain SNARK is needed.
-    //    Committing a fake in-node tree or tampering content_metas changes the
-    //    computed content_hash and breaks the binding below (cross-node
+    // -- Node identity: authenticate each node's real (pre-padding) tree root
+    //    via the pad-forward check — padding merkle_native_roots[i] forward
+    //    n_pad times (mirroring pad_to_needed byte-for-byte: current in X_L,
+    //    zero sibling, SHA256_IV) must reach the shift-authenticated padded
+    //    root merkle_roots[i]. The depth (hence n_pad) derives from the
+    //    authenticated fanout, so a chain of the wrong tree depth cannot pass.
+    //    content_hash is then COMPUTED natively over the authenticated
+    //    native_root; committing a fake in-node tree or tampering
+    //    content_metas changes it and breaks the binding below (cross-node
     //    parent-leaf / public root). --
     let mut content_hashes: Vec<[u32; 8]> = Vec::with_capacity(u);
     for i in 0..u {
-        let siblings = &proof.merkle_siblings[i];
-        let depth = siblings.len();
-        let sides: Vec<bool> = (0..depth).map(|d| authenticated_side(proof, i, d)).collect();
-        let recomputed = recompute_native_root(&proof.merkle_leaves[i], siblings, &sides);
+        let n_pad = proof.merkle_block_counts[i] - innode_depth(&proof.content_metas[i]);
+        let mut padded = proof.merkle_native_roots[i];
+        for _ in 0..n_pad {
+            let mut m = [0u32; 16];
+            m[..8].copy_from_slice(&padded);
+            padded = sha256_compress(&SHA256_IV, &m);
+        }
+        if padded != proof.merkle_roots[i] {
+            return Err(MhotMembershipError::NativeRootMismatch { node_idx: i });
+        }
         let ch = compute_content_hash(
             &proof.content_metas[i],
-            &leaf_words_to_digest_bytes(&recomputed),
+            &leaf_words_to_digest_bytes(&proof.merkle_native_roots[i]),
         );
         content_hashes.push(bytes_to_words(&ch));
     }
@@ -324,7 +329,7 @@ pub fn verify_sound_multiproof(
     let t7 = std::time::Instant::now();
     if vt {
         let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
-        eprintln!("[verify] merkle_core={:.1}ms merkle_shifts={:.1}ms merkle_pcs+recompute={:.1}ms cross+root+route={:.1}ms total={:.1}ms",
+        eprintln!("[verify] merkle_core={:.1}ms merkle_shifts={:.1}ms merkle_pcs+padfwd={:.1}ms cross+root+route={:.1}ms total={:.1}ms",
             ms(t1-t0), ms(t2-t1), ms(t3-t2), ms(t7-t3), ms(t7-t0));
     }
     Ok(())
@@ -341,11 +346,16 @@ pub fn verify_sound_multiproof(
 ///
 /// FIAT-SHAMIR NOTE: `entries` are bound purely by these verifier-side native
 /// checks and are intentionally NOT absorbed into the transcript — sound today
-/// because every input to the checks (content_metas, b_bits, leaf_is_right,
-/// siblings, leaves) is transitively authenticated against `expected_root`. If
-/// these checks ever move in-protocol (Route 2 / RLC-batched public claims),
-/// `entries` and `path_mapping` MUST be absorbed BEFORE any batching coefficient
-/// is sampled, or a Jolt-style unfaithful-claims under-binding reopens forgeries.
+/// because every input to the checks (content_metas, b_bits, merkle_leaves,
+/// merkle_native_roots via the pad-forward binding to the shift-authenticated
+/// merkle_roots) is transitively authenticated against `expected_root` through
+/// deterministic equalities that consume no sampled challenge. The same applies
+/// to the shift's public IO (b_bits/leaves/roots/block_counts): they are pinned
+/// by those downstream native checks, not by transcript absorption. If any of
+/// these checks ever moves in-protocol (RLC-batched public claims), `entries`,
+/// `path_mapping` AND the shift public IO MUST be absorbed BEFORE any batching
+/// coefficient is sampled, or a Jolt-style unfaithful-claims under-binding
+/// reopens forgeries.
 pub fn verify_sound_multiproof_with_entries(
     proof: &SoundMultiproof,
     expected_root: &[u32; 8],

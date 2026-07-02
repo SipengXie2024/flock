@@ -24,7 +24,7 @@ fn words_to_bytes(w: &[u32; 8]) -> [u8; 32] {
 }
 
 fn node_content_hash_bytes(node: &MhotNodeWitness, content: &ContentMeta) -> [u8; 32] {
-    let w = mhot_node_to_sha256_merkle(node);
+    let w = mhot_node_to_sha256_merkle(node, false);
     let merkle_root = words_to_bytes(&w.native_root);
     compute_content_hash(content, &merkle_root)
 }

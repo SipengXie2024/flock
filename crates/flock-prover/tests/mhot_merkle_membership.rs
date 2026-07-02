@@ -148,7 +148,7 @@ fn words_to_bytes_helper(w: &[u32; 8]) -> [u8; 32] {
 }
 
 fn flock_root_bytes(node: &MhotNodeWitness) -> [u8; 32] {
-    let w = mhot_node_to_sha256_merkle(node);
+    let w = mhot_node_to_sha256_merkle(node, false);
     use flock_prover::r1cs_hashes::sha2::{SHA256_IV, sha256_compress, min_n_blocks_log};
     let n_real = w.compressions.len();
     let mut compressions = w.compressions;
@@ -246,7 +246,7 @@ fn synthetic_content(nc: usize) -> ContentMeta {
 }
 
 fn node_content_hash_bytes(node: &MhotNodeWitness, content: &ContentMeta) -> [u8; 32] {
-    let w = mhot_node_to_sha256_merkle(node);
+    let w = mhot_node_to_sha256_merkle(node, false);
     let merkle_root = words_to_bytes_helper(&w.native_root);
     compute_content_hash(content, &merkle_root)
 }

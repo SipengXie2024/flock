@@ -337,7 +337,7 @@ mod tests {
                     selected_child: child_node.selected_child,
                 };
                 let child_witness =
-                    super::super::native_witness::mhot_node_to_sha256_merkle(&child_merkle_node);
+                    super::super::native_witness::mhot_node_to_sha256_merkle(&child_merkle_node, false);
                 let child_native_root_bytes = native_root_to_bytes(&child_witness.native_root);
                 let (_, child_content_hash) = content_hash_to_sha256_chain(
                     &child_node.extraction_masks,

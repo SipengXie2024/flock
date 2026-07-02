@@ -34,6 +34,9 @@ pub enum MhotMembershipError {
         expected: [u32; 8],
         actual: [u32; 8],
     },
+    /// Pad-forwarding the claimed native_root did not reach the shift-
+    /// authenticated padded root (the native_root↔merkle_roots binding).
+    NativeRootMismatch { node_idx: usize },
     /// Number of public entries does not match the number of proven paths.
     EntryCountMismatch { n_entries: usize, n_paths: usize },
     /// The public key does not route to the authenticated child position at
@@ -73,7 +76,7 @@ pub fn prove_node_merkle<Ch: Challenger>(
     node: &MhotNodeWitness,
     challenger: &mut Ch,
 ) -> NodeMerkleProof {
-    let w = mhot_node_to_sha256_merkle(node);
+    let w = mhot_node_to_sha256_merkle(node, false);
     let n_real = w.compressions.len();
 
     let mut compressions = w.compressions;
@@ -424,59 +427,6 @@ pub(crate) fn pd_point(setup: &RouteF32Setup, instance: usize, within: usize) ->
     (0..l)
         .map(|k| if (gpi >> k) & 1 == 1 { F128::ONE } else { F128::ZERO })
         .collect()
-}
-
-/// Recompute the real in-node binary Merkle tree root from the selected leaf,
-/// the per-level siblings, and the per-level REAL side bits (true = leaf/current
-/// is the right child at that level). Mirrors `native_witness`'s tree order; used
-/// by the verifier to bind the committed merkle tree to content_hash's root.
-pub(crate) fn recompute_native_root(
-    leaf: &[u32; 8],
-    siblings: &[[u32; 8]],
-    sides: &[bool],
-) -> [u32; 8] {
-    assert_eq!(siblings.len(), sides.len(), "siblings/sides length mismatch");
-    let mut current = *leaf;
-    for (sibling, &is_right) in siblings.iter().zip(sides.iter()) {
-        let mut m = [0u32; 16];
-        if is_right {
-            m[..8].copy_from_slice(sibling);
-            m[8..].copy_from_slice(&current);
-        } else {
-            m[..8].copy_from_slice(&current);
-            m[8..].copy_from_slice(sibling);
-        }
-        current = crate::r1cs_hashes::sha2::sha256_compress(
-            &crate::r1cs_hashes::sha2::SHA256_IV,
-            &m,
-        );
-    }
-    current
-}
-
-/// PackedDirectClaim point selecting the F128 at `within ∈ {0,1}` of `slot`'s
-/// 256-bit region in merkle compression block `block_index`, over
-/// `L = m − LOG_PACKING` coords. A 256-bit slot occupies 2 packed F128, so slot
-/// `s` has packed base `s·2`; a block occupies `2^(K_LOG−LOG_PACKING)` packed.
-pub(crate) fn merkle_slot_pd_point(
-    m_merkle: usize,
-    block_index: usize,
-    slot: usize,
-    within: usize,
-) -> Vec<F128> {
-    let block_packed = 1usize << (crate::r1cs_hashes::sha2::K_LOG - pcs::LOG_PACKING);
-    let gpi = block_index * block_packed + slot * 2 + within;
-    let l = m_merkle - pcs::LOG_PACKING;
-    (0..l)
-        .map(|k| if (gpi >> k) & 1 == 1 { F128::ONE } else { F128::ZERO })
-        .collect()
-}
-
-/// The two F128 values a child digest occupies in a merkle message slot
-/// (word-major `cv_to_phys_bits` order, matching how message words are committed).
-pub(crate) fn digest_to_slot_f128(d: &[u32; 8]) -> [F128; 2] {
-    let bits = crate::r1cs_hashes::sha2::cv_to_phys_bits(d);
-    [pack_bits_to_f128(&bits[0..128]), pack_bits_to_f128(&bits[128..256])]
 }
 
 /// Prove a single sound MHOT membership path.

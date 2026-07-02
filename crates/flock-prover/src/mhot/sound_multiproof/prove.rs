@@ -56,8 +56,7 @@ use flock_core::pcs::{
 };
 
 use crate::mhot::merkle_membership::{
-    MhotMembershipInput, SOF_PACKED_BASE, digest_to_slot_f128,
-    merkle_slot_pd_point, pad_to_needed, pd_point, route_sof_f128,
+    MhotMembershipInput, SOF_PACKED_BASE, pad_to_needed, pd_point, route_sof_f128,
 };
 use crate::mhot::multiproof::{fork_pcs_challenger, open_core_ligerito};
 use crate::mhot::native_witness::mhot_node_to_sha256_merkle;
@@ -139,43 +138,20 @@ pub fn prove_sound_multiproof(
     eprintln!("[mem] after dedup ({} unique): {:.0} MB", u, vmrss_mb());
 
     // -- Per-node: compute in-node merkle compressions and block counts --
+    // native_order=true: the chain IS the true in-node tree path, so the shift
+    // authenticates the padded native root directly (no siblings needed for the
+    // verifier — it binds native_root via the pad-forward check instead).
     let mut merkle_data: Vec<(Vec<Compression>, Vec<bool>, [u32; 8], [u32; 8], [u32; 8])> =
         Vec::with_capacity(u);
     let mut merkle_block_counts: Vec<usize> = Vec::with_capacity(u);
-    let mut merkle_siblings: Vec<Vec<[u32; 8]>> = Vec::with_capacity(u);
-    let mut merkle_sib_slots: Vec<Vec<usize>> = Vec::with_capacity(u);
 
-    for (_node_idx, input) in unique_nodes.iter().enumerate() {
-        let w = mhot_node_to_sha256_merkle(&input.node);
+    for input in unique_nodes.iter() {
+        let w = mhot_node_to_sha256_merkle(&input.node, true);
         let n_real_merkle = w.compressions.len();
         let mut compressions = w.compressions;
         let mut b_bits = w.b_bits.clone();
         let needed = 1usize << min_n_blocks_log(n_real_merkle);
         let padded_root = pad_to_needed(&mut compressions, &mut b_bits, needed);
-
-        // Per-level siblings (values + committed slots) for the verifier's
-        // native_root recompute. Only the real depth carries siblings; the
-        // padding blocks are zero-sibling.
-        let selected = input.node.selected_child;
-        let mut node_sibs: Vec<[u32; 8]> = Vec::with_capacity(n_real_merkle);
-        let mut node_slots: Vec<usize> = Vec::with_capacity(n_real_merkle);
-        for d in 0..n_real_merkle {
-            let m = &compressions[d].1;
-            let real_side = (selected >> d) & 1 == 1;
-            // Sibling is in X_R (m[8..16]) at d=0 (leaf forced left) and whenever
-            // the real side is left; in X_L (m[0..8]) when the real side is right.
-            let (src, slot): (&[u32], usize) = if d == 0 || !real_side {
-                (&m[8..16], MERKLE_LAYOUT.x_r_slot as usize)
-            } else {
-                (&m[0..8], MERKLE_LAYOUT.x_l_slot as usize)
-            };
-            let mut sib = [0u32; 8];
-            sib.copy_from_slice(src);
-            node_sibs.push(sib);
-            node_slots.push(slot);
-        }
-        merkle_siblings.push(node_sibs);
-        merkle_sib_slots.push(node_slots);
 
         merkle_data.push((compressions, b_bits, w.leaf, padded_root, w.native_root));
         merkle_block_counts.push(needed);
@@ -238,21 +214,6 @@ pub fn prove_sound_multiproof(
         );
         merkle_shifts.push(shift_proof);
         merkle_pd_claims.push(pd);
-
-        // Sibling PD claims: pin each committed sibling slot to its claimed value
-        // so the verifier's native_root recompute uses authenticated siblings.
-        let block_base = merkle_alloc.offsets[i];
-        for (d, (sib, &slot)) in
-            merkle_siblings[i].iter().zip(merkle_sib_slots[i].iter()).enumerate()
-        {
-            let vals = digest_to_slot_f128(sib);
-            for within in 0..2 {
-                let point =
-                    merkle_slot_pd_point(merkle_setup.r1cs.m, block_base + d, slot, within);
-                let eq_ind = pcs::DirectEqInd::Sparse(pcs::ring_switch::build_eq_sparse(&point));
-                merkle_pd_claims.push(PackedDirectClaim { point, value: vals[within], eq_ind });
-            }
-        }
     }
 
     let mut merkle_pcs_ch = fork_pcs_challenger(challenger, b"merkle");
@@ -303,10 +264,7 @@ pub fn prove_sound_multiproof(
         merkle_leaves: (0..u).map(|i| merkle_data[i].2).collect(),
         merkle_roots: (0..u).map(|i| merkle_data[i].3).collect(),
         merkle_b_bits: (0..u).map(|i| merkle_data[i].1.clone()).collect(),
-        merkle_siblings,
-        merkle_leaf_is_right: (0..u)
-            .map(|i| unique_nodes[i].node.selected_child & 1 == 1)
-            .collect(),
+        merkle_native_roots: (0..u).map(|i| merkle_data[i].4).collect(),
         content_metas: (0..u).map(|i| unique_nodes[i].content.clone()).collect(),
 
         merkle_block_offsets: merkle_alloc.offsets,
