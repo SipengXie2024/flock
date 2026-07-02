@@ -47,7 +47,6 @@ pub struct SoundMultiproof {
     pub merkle_shifts: Vec<MerklePathShiftProof>,
     pub merkle_leaves: Vec<[u32; 8]>,
     pub merkle_roots: Vec<[u32; 8]>,
-    pub merkle_native_roots: Vec<[u32; 8]>,
     pub merkle_b_bits: Vec<Vec<bool>>,
     // Per-node authenticated in-node Merkle siblings (real depth), the true
     // depth-0 side bit, and content metadata — the verifier recomputes the

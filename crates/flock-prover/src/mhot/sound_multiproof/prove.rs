@@ -387,7 +387,6 @@ pub(crate) fn prove_sound_multiproof_impl(
         merkle_shifts,
         merkle_leaves: (0..u).map(|i| merkle_data[i].2).collect(),
         merkle_roots: (0..u).map(|i| merkle_data[i].3).collect(),
-        merkle_native_roots: (0..u).map(|i| merkle_data[i].4).collect(),
         merkle_b_bits: (0..u).map(|i| merkle_data[i].1.clone()).collect(),
         merkle_siblings,
         merkle_leaf_is_right: (0..u)
