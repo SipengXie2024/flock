@@ -3431,15 +3431,7 @@ mod tests {
     /// Build a coord vector with `n_zeros` exact-zero entries at the requested
     /// positions and random F128s elsewhere.
     fn mk_coords(rng: &mut Rng, n: usize, zero_positions: &[usize]) -> Vec<F128> {
-        (0..n)
-            .map(|i| {
-                if zero_positions.contains(&i) {
-                    F128::ZERO
-                } else {
-                    rng.f128()
-                }
-            })
-            .collect()
+        mk_coords_bool(rng, n, zero_positions, &[])
     }
 
     /// Coord vector with exact zeros at `zero_positions`, exact ones at

@@ -78,7 +78,7 @@ pub fn prove_mhot_multiproof(paths: &[MhotPathInput]) -> MhotMultiproof {
     }
 
     let all_fanouts: Vec<Vec<usize>> = paths.iter().map(|p| p.schedule.fanouts.clone()).collect();
-    let schedules: Vec<MhotHashSchedule> = paths.iter().map(|p| p.schedule.clone()).collect();
+    let _schedules: Vec<MhotHashSchedule> = paths.iter().map(|p| p.schedule.clone()).collect();
 
     let total_keccaks: usize = paths.iter().map(|p| p.schedule.hash_atoms.len()).sum();
     let total_routes: usize = paths.iter().map(|p| p.route_witnesses.len()).sum();
@@ -190,7 +190,7 @@ pub fn prove_mhot_multiproof_shared(paths: &[MhotPathInput]) -> MhotMultiproof {
     }
 
     let all_fanouts: Vec<Vec<usize>> = paths.iter().map(|p| p.schedule.fanouts.clone()).collect();
-    let schedules: Vec<MhotHashSchedule> = paths.iter().map(|p| p.schedule.clone()).collect();
+    let _schedules: Vec<MhotHashSchedule> = paths.iter().map(|p| p.schedule.clone()).collect();
 
     let mut all_atom_states_full: Vec<[u8; 200]> = Vec::new();
     for path in paths {

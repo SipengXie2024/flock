@@ -1,4 +1,5 @@
 pub mod content;
+pub mod entry_binding;
 pub mod hash_only;
 pub mod membership;
 pub mod merkle_membership;

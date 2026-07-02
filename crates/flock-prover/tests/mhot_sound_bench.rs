@@ -4,9 +4,7 @@ use flock_core::challenger::FsChallenger;
 use flock_prover::mhot::{
     merkle_membership::{ContentMeta, MhotMembershipInput, PathEntry, mhot_node_to_route_witness},
     native_witness::MhotNodeWitness,
-    sound_multiproof::{
-        prove_sound_multiproof, verify_sound_multiproof, verify_sound_multiproof_with_entries,
-    },
+    sound_multiproof::{prove_sound_multiproof, verify_sound_multiproof_with_entries},
 };
 use serde::Deserialize;
 
@@ -31,10 +29,7 @@ struct PathData {
 #[derive(Deserialize)]
 struct ExportData {
     paths: Vec<PathData>,
-    native_single_proof_total_bytes: usize,
     native_multi_proof_bytes: usize,
-    native_verify_seq_ms: f64,
-    native_verify_par_ms: f64,
     native_verify_multi_ms: f64,
 }
 
@@ -61,8 +56,8 @@ fn node_data_to_input(nd: &NodeData) -> MhotMembershipInput {
 #[test]
 fn sound_vs_native_benchmark() {
     eprintln!();
-    // Baseline policy (2026-07-02): native multi TRUE (batched HOTMultiProof) is
-    // THE baseline — single-total denies native its own batching and is banned.
+    // Baseline is native multi TRUE (batched HOTMultiProof): single-total denies
+    // native its own cross-path sibling sharing and is not a like-for-like batch.
     eprintln!("=== MHOT Membership Proof: Native multi TRUE vs Flock Sound (1M-key SHA-256 tree) ===");
     eprintln!("{:>6} {:>10} {:>10} {:>8} {:>10} {:>10} {:>10} {:>8}",
         "N", "nmulti_KB", "flock_KB", "ratio", "nv_mul_ms", "fp_ms", "fv_ms", "unique");
@@ -94,24 +89,28 @@ fn sound_vs_native_benchmark() {
         let root_u = proof.path_mapping.node_indices[0][0];
         let root = proof.chain_content_hashes[root_u];
 
-        // Full-statement verify when the export carries entries (key, value);
-        // old-format exports fall back to the structural check.
-        let entries: Option<Vec<PathEntry>> = data.paths.iter()
-            .map(|p| {
-                (p.key.len() == 32).then(|| PathEntry {
-                    key: p.key.clone().try_into().unwrap(),
-                    value: p.value.clone(),
-                })
+        // The benchmark measures the FULL membership statement — refuse to run
+        // against an old-format export that lacks (key, value), rather than
+        // silently downgrading to the weaker structural verify and reporting the
+        // number as a full-statement cost.
+        assert!(
+            data.paths.iter().all(|p| p.key.len() == 32),
+            "{} is an old-format export without per-path keys; regenerate it with \
+             export_membership_paths_for_flock before benchmarking (would otherwise \
+             silently measure structural-only verify)",
+            filename
+        );
+        let entries: Vec<PathEntry> = data.paths.iter()
+            .map(|p| PathEntry {
+                key: p.key.clone().try_into().unwrap(),
+                value: p.value.clone(),
             })
             .collect();
 
         let mut chv = FsChallenger::new(b"sound-vs-native");
         let t1 = Instant::now();
-        match &entries {
-            Some(es) => verify_sound_multiproof_with_entries(&proof, &root, es, &mut chv)
-                .expect("must verify with entries"),
-            None => verify_sound_multiproof(&proof, &root, &mut chv).expect("must verify"),
-        }
+        verify_sound_multiproof_with_entries(&proof, &root, &entries, &mut chv)
+            .expect("must verify with entries");
         let verify_ms = t1.elapsed().as_secs_f64() * 1e3;
 
         let flock_bytes = proof.proof_size_bytes();
