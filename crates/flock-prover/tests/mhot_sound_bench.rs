@@ -2,9 +2,11 @@ use std::time::Instant;
 
 use flock_core::challenger::FsChallenger;
 use flock_prover::mhot::{
-    merkle_membership::{ContentMeta, MhotMembershipInput, mhot_node_to_route_witness},
+    merkle_membership::{ContentMeta, MhotMembershipInput, PathEntry, mhot_node_to_route_witness},
     native_witness::MhotNodeWitness,
-    sound_multiproof::{prove_sound_multiproof, verify_sound_multiproof},
+    sound_multiproof::{
+        prove_sound_multiproof, verify_sound_multiproof, verify_sound_multiproof_with_entries,
+    },
 };
 use serde::Deserialize;
 
@@ -20,6 +22,10 @@ struct NodeData {
 #[derive(Deserialize)]
 struct PathData {
     nodes: Vec<NodeData>,
+    #[serde(default)]
+    key: Vec<u8>,
+    #[serde(default)]
+    value: Vec<u8>,
 }
 
 #[derive(Deserialize)]
@@ -55,9 +61,11 @@ fn node_data_to_input(nd: &NodeData) -> MhotMembershipInput {
 #[test]
 fn sound_vs_native_benchmark() {
     eprintln!();
-    eprintln!("=== MHOT Membership Proof: Native vs Flock Sound (1M-key SHA-256 tree) ===");
+    // Baseline policy (2026-07-02): native multi TRUE (batched HOTMultiProof) is
+    // THE baseline — single-total denies native its own batching and is banned.
+    eprintln!("=== MHOT Membership Proof: Native multi TRUE vs Flock Sound (1M-key SHA-256 tree) ===");
     eprintln!("{:>6} {:>10} {:>10} {:>8} {:>10} {:>10} {:>10} {:>8}",
-        "N", "native_KB", "flock_KB", "ratio", "nv_ms", "fp_ms", "fv_ms", "unique");
+        "N", "nmulti_KB", "flock_KB", "ratio", "nv_mul_ms", "fp_ms", "fv_ms", "unique");
     eprintln!("{}", "-".repeat(80));
 
     for &n in &[1, 16, 256, 4096] {
@@ -75,6 +83,9 @@ fn sound_vs_native_benchmark() {
             .map(|p| p.nodes.iter().map(node_data_to_input).collect())
             .collect();
 
+        // Per-N peaks must not include the previous N's retained scratch pool.
+        flock_core::scratch::clear();
+
         let mut ch = FsChallenger::new(b"sound-vs-native");
         let t0 = Instant::now();
         let proof = prove_sound_multiproof(&paths, &mut ch);
@@ -82,19 +93,35 @@ fn sound_vs_native_benchmark() {
 
         let root_u = proof.path_mapping.node_indices[0][0];
         let root = proof.chain_content_hashes[root_u];
+
+        // Full-statement verify when the export carries entries (key, value);
+        // old-format exports fall back to the structural check.
+        let entries: Option<Vec<PathEntry>> = data.paths.iter()
+            .map(|p| {
+                (p.key.len() == 32).then(|| PathEntry {
+                    key: p.key.clone().try_into().unwrap(),
+                    value: p.value.clone(),
+                })
+            })
+            .collect();
+
         let mut chv = FsChallenger::new(b"sound-vs-native");
         let t1 = Instant::now();
-        verify_sound_multiproof(&proof, &root, &mut chv).expect("must verify");
+        match &entries {
+            Some(es) => verify_sound_multiproof_with_entries(&proof, &root, es, &mut chv)
+                .expect("must verify with entries"),
+            None => verify_sound_multiproof(&proof, &root, &mut chv).expect("must verify"),
+        }
         let verify_ms = t1.elapsed().as_secs_f64() * 1e3;
 
         let flock_bytes = proof.proof_size_bytes();
-        let native_kb = data.native_single_proof_total_bytes as f64 / 1024.0;
+        let native_kb = data.native_multi_proof_bytes as f64 / 1024.0;
         let flock_kb = flock_bytes as f64 / 1024.0;
         let ratio = flock_kb / native_kb;
         let unique = proof.merkle_leaves.len();
 
         eprintln!("{:>6} {:>10.1} {:>10.1} {:>7.1}x {:>10.2} {:>10.1} {:>10.1} {:>8}",
             n, native_kb, flock_kb, ratio,
-            data.native_verify_seq_ms, prove_ms, verify_ms, unique);
+            data.native_verify_multi_ms, prove_ms, verify_ms, unique);
     }
 }

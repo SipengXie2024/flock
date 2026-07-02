@@ -41,10 +41,10 @@ use flock_core::pcs::{
 use flock_core::zerocheck::ZerocheckProof;
 
 use super::merkle_membership::{
-    ContentMeta, MhotMembershipError, MhotMembershipInput, SOF_PACKED_BASE,
-    build_content_hash_chain, compute_content_hash, digest_to_slot_f128, digest_to_sof_f128,
-    leaf_words_to_digest_bytes, merkle_slot_pd_point, pad_to_needed, pd_point,
-    recompute_native_root, route_sof_f128,
+    ContentMeta, MhotMembershipError, MhotMembershipInput, PathEntry, SOF_PACKED_BASE,
+    build_content_hash_chain, compute_content_hash, compute_dense_key, digest_to_slot_f128,
+    digest_to_sof_f128, leaf_content_hash, leaf_words_to_digest_bytes, merkle_slot_pd_point,
+    pad_to_needed, pd_point, recompute_native_root, route_sof_f128, search_in_sparse_keys,
 };
 use super::multiproof::{fork_pcs_challenger, open_core_ligerito, verify_core_opening_ligerito};
 use super::native_witness::mhot_node_to_sha256_merkle;
@@ -287,11 +287,13 @@ pub(crate) fn prove_sound_multiproof_impl(
     let merkle_comps = build_comp_vec(&merkle_comp_data, merkle_alloc.n_total);
     drop(merkle_comp_data);
 
+    // Setup before witness: the R1CS/params build transients must not stack
+    // on top of the four live witness buffers (cached() is pure — no
+    // challenger interaction, so the swap is transcript-neutral).
+    let merkle_setup = Sha256HybridSetup::cached(merkle_alloc.n_total);
     let (mz, ma, mb, mzlc) =
         generate_witness_with_ab_packed_and_lincheck(&merkle_comps, merkle_alloc.n_log);
     drop(merkle_comps);
-
-    let merkle_setup = Sha256HybridSetup::cached(merkle_alloc.n_total);
     let merkle_core = prove_fast_core_with_block_count(
         &merkle_setup.r1cs, &merkle_setup.pcs_params,
         mz, ma, mb, mzlc,
@@ -366,11 +368,10 @@ pub(crate) fn prove_sound_multiproof_impl(
     let chain_comps = build_comp_vec(&chain_comp_data, chain_alloc.n_total);
     drop(chain_comp_data);
 
+    let chain_setup = Sha256HybridSetup::cached(chain_alloc.n_total);
     let (cz, ca, cb, czlc) =
         generate_witness_with_ab_packed_and_lincheck(&chain_comps, chain_alloc.n_log);
     drop(chain_comps);
-
-    let chain_setup = Sha256HybridSetup::cached(chain_alloc.n_total);
     let chain_core = prove_fast_core_with_block_count(
         &chain_setup.r1cs, &chain_setup.pcs_params,
         cz, ca, cb, czlc,
@@ -745,19 +746,210 @@ pub fn verify_sound_multiproof(
     let t7 = std::time::Instant::now();
     if vt {
         let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
-        eprintln!("[verify] merkle_core={:.1}ms merkle_shifts={:.1}ms merkle_pcs={:.1}ms chain_core={:.1}ms chain_shifts={:.1}ms chain_pcs={:.1}ms cross+root={:.1}ms route={:.1}ms total={:.1}ms",
-            ms(t1-t0), ms(t2-t1), ms(t3-t2), ms(t4-t3), ms(t5-t4), ms(t6-t5), ms(t6.duration_since(t5)), ms(t7-t6), ms(t7-t0));
+        eprintln!("[verify] merkle_core={:.1}ms merkle_shifts={:.1}ms merkle_pcs+recompute={:.1}ms chain_core+shifts={:.1}ms chain_pcs={:.1}ms cross+root={:.1}ms route={:.1}ms total={:.1}ms",
+            ms(t1-t0), ms(t2-t1), ms(t3-t2), ms(t4-t3), ms(t5-t4), ms(t6-t5), ms(t7-t6), ms(t7-t0));
+    }
+    Ok(())
+}
+
+/// Full-statement verify: the structural checks of [`verify_sound_multiproof`]
+/// plus native entry binding — for each path, the public (key, value) must
+/// route through every authenticated node (HOT routing re-run by the verifier
+/// on the authenticated ContentMetas, matched against the in-node position the
+/// sibling recompute walked) and the terminal authenticated leaf must equal
+/// the entry's leaf hash. This makes the proven statement equal to native's:
+/// "each (key, value) in `entries` is a member under `expected_root`".
+pub fn verify_sound_multiproof_with_entries(
+    proof: &SoundMultiproof,
+    expected_root: &[u32; 8],
+    entries: &[PathEntry],
+    challenger: &mut FsChallenger,
+) -> Result<(), MhotMembershipError> {
+    verify_sound_multiproof(proof, expected_root, challenger)?;
+
+    let n_paths = proof.path_mapping.node_indices.len();
+    if entries.len() != n_paths {
+        return Err(MhotMembershipError::EntryCountMismatch {
+            n_entries: entries.len(),
+            n_paths,
+        });
+    }
+
+    for (p, (indices, entry)) in proof
+        .path_mapping
+        .node_indices
+        .iter()
+        .zip(entries.iter())
+        .enumerate()
+    {
+        for (level, &u_i) in indices.iter().enumerate() {
+            let meta = &proof.content_metas[u_i];
+            let dense = compute_dense_key(&entry.key, &meta.extraction_masks);
+            let matched = search_in_sparse_keys(dense, &meta.sparse_partial_keys);
+
+            // The authenticated in-node position: the sides the native_root
+            // recompute walked encode the selected child index, LSB at depth 0.
+            let depth = proof.merkle_siblings[u_i].len();
+            let mut selected = 0usize;
+            for d in 0..depth {
+                let side = if d == 0 {
+                    proof.merkle_leaf_is_right[u_i]
+                } else {
+                    proof.merkle_b_bits[u_i].get(d).copied().unwrap_or(false)
+                };
+                if side {
+                    selected |= 1 << d;
+                }
+            }
+            if matched != selected {
+                return Err(MhotMembershipError::RoutingMismatch {
+                    path_idx: p,
+                    level,
+                    matched,
+                    selected,
+                });
+            }
+        }
+
+        let last_u = *indices.last().expect("path verified non-empty");
+        let expected_leaf = bytes_to_words(&leaf_content_hash(entry));
+        if proof.merkle_leaves[last_u] != expected_leaf {
+            return Err(MhotMembershipError::EntryLeafMismatch { path_idx: p });
+        }
     }
     Ok(())
 }
 
 #[cfg(test)]
 mod forgery_tests {
-    use super::{prove_sound_multiproof_impl, verify_sound_multiproof};
-    use crate::mhot::merkle_membership::MhotMembershipInput;
+    use super::{
+        prove_sound_multiproof, prove_sound_multiproof_impl, verify_sound_multiproof,
+        verify_sound_multiproof_with_entries,
+    };
+    use crate::mhot::merkle_membership::{
+        ContentMeta, MhotMembershipError, MhotMembershipInput, PathEntry, compute_content_hash,
+        leaf_content_hash, leaf_words_to_digest_bytes, mhot_node_to_route_witness,
+    };
     use crate::mhot::native_witness::{mhot_node_to_sha256_merkle, MhotNodeWitness};
     use flock_core::challenger::FsChallenger;
     use std::collections::HashMap;
+
+    /// Two-node honest path whose ContentMetas genuinely route `entry.key`:
+    /// root R (selects child 0 = T) → terminal T (selects child 1 = entry leaf).
+    fn honest_path_with_entry() -> (Vec<MhotMembershipInput>, PathEntry) {
+        let mut key = [0u8; 32];
+        key[7] = 1; // BE chunk 0 = 1 → discriminative bit 0 of T's mask is set
+        let entry = PathEntry { key, value: vec![7u8; 16] };
+        let leaf_ch = leaf_content_hash(&entry);
+
+        // Terminal node T: masks[0]=0b1 → dense(key)=1; sparse [0,1] → child 1.
+        let t_node = MhotNodeWitness {
+            children: vec![[0x11; 32], leaf_ch],
+            selected_child: 1,
+        };
+        let t_meta = ContentMeta {
+            extraction_masks: [1, 0, 0, 0],
+            sparse_partial_keys: vec![0, 1],
+            child_leaf_counts: vec![1, 1],
+        };
+        let t_root = mhot_node_to_sha256_merkle(&t_node).native_root;
+        let t_ch = compute_content_hash(&t_meta, &leaf_words_to_digest_bytes(&t_root));
+
+        // Root node R: masks[0]=0b10 → dense(key)=0 (key bit 1 clear); sparse
+        // [0,1] → child 0 = T.
+        let r_node = MhotNodeWitness {
+            children: vec![t_ch, [0x22; 32]],
+            selected_child: 0,
+        };
+        let r_meta = ContentMeta {
+            extraction_masks: [2, 0, 0, 0],
+            sparse_partial_keys: vec![0, 1],
+            child_leaf_counts: vec![2, 1],
+        };
+
+        let mk = |node: MhotNodeWitness, content: ContentMeta| MhotMembershipInput {
+            route_witness: mhot_node_to_route_witness(&node),
+            node,
+            content,
+        };
+        (vec![mk(r_node, r_meta), mk(t_node, t_meta)], entry)
+    }
+
+    fn prove_and_root(
+        paths: &[Vec<MhotMembershipInput>],
+    ) -> (super::SoundMultiproof, [u32; 8]) {
+        let mut ch = FsChallenger::new(b"smp-entries");
+        let proof = prove_sound_multiproof(paths, &mut ch);
+        let root = proof.chain_content_hashes[proof.path_mapping.node_indices[0][0]];
+        (proof, root)
+    }
+
+    #[test]
+    fn entries_binding_honest_accepts() {
+        let (path, entry) = honest_path_with_entry();
+        let (proof, root) = prove_and_root(&[path]);
+        let mut chv = FsChallenger::new(b"smp-entries");
+        verify_sound_multiproof_with_entries(&proof, &root, &[entry], &mut chv)
+            .expect("honest entry must verify");
+    }
+
+    /// Absent-key bit-flip forgery: flip a key bit OUTSIDE every mask — the
+    /// routing is unchanged, so before the terminal-leaf check this non-member
+    /// key would be accepted. The leaf hash must catch it.
+    #[test]
+    fn entries_binding_nondiscriminative_bitflip_rejected() {
+        let (path, mut entry) = honest_path_with_entry();
+        let (proof, root) = prove_and_root(&[path]);
+        entry.key[31] ^= 1; // chunk 3; masks[3] == 0 everywhere on the path
+        let mut chv = FsChallenger::new(b"smp-entries");
+        let res = verify_sound_multiproof_with_entries(&proof, &root, &[entry], &mut chv);
+        assert!(
+            matches!(res, Err(MhotMembershipError::EntryLeafMismatch { path_idx: 0 })),
+            "non-member key differing only outside the masks must be rejected, got {res:?}"
+        );
+    }
+
+    /// A key whose discriminative bit routes to a DIFFERENT child than the
+    /// proof authenticated must fail the routing re-run.
+    #[test]
+    fn entries_binding_wrong_routing_rejected() {
+        let (path, mut entry) = honest_path_with_entry();
+        let (proof, root) = prove_and_root(&[path]);
+        entry.key[7] = 0; // T's dense key becomes 0 → routes to child 0, proof selected 1
+        let mut chv = FsChallenger::new(b"smp-entries");
+        let res = verify_sound_multiproof_with_entries(&proof, &root, &[entry], &mut chv);
+        assert!(
+            matches!(res, Err(MhotMembershipError::RoutingMismatch { path_idx: 0, level: 1, .. })),
+            "key routing to a different child must be rejected, got {res:?}"
+        );
+    }
+
+    #[test]
+    fn entries_binding_wrong_value_rejected() {
+        let (path, mut entry) = honest_path_with_entry();
+        let (proof, root) = prove_and_root(&[path]);
+        entry.value = vec![8u8; 16];
+        let mut chv = FsChallenger::new(b"smp-entries");
+        let res = verify_sound_multiproof_with_entries(&proof, &root, &[entry], &mut chv);
+        assert!(
+            matches!(res, Err(MhotMembershipError::EntryLeafMismatch { path_idx: 0 })),
+            "wrong value must be rejected, got {res:?}"
+        );
+    }
+
+    #[test]
+    fn entries_binding_count_mismatch_rejected() {
+        let (path, entry) = honest_path_with_entry();
+        let (proof, root) = prove_and_root(&[path]);
+        let mut chv = FsChallenger::new(b"smp-entries");
+        let res = verify_sound_multiproof_with_entries(
+            &proof, &root, &[entry.clone(), entry], &mut chv,
+        );
+        assert!(
+            matches!(res, Err(MhotMembershipError::EntryCountMismatch { .. })),
+            "entry count mismatch must be rejected, got {res:?}"
+        );
+    }
 
     /// Forgery: a malicious prover runs the merkle pass on a FAKE in-node tree
     /// whose selected child is a non-member `L`, but runs the content-hash chain
