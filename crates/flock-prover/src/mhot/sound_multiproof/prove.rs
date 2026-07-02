@@ -40,19 +40,14 @@ fn node_identity(input: &MhotMembershipInput) -> Vec<u8> {
     bytes
 }
 
-use crate::chain::prove_chain_shift;
 use crate::merkle_path::prove_merkle_path_shift;
 use crate::prover::prove_fast_core_with_block_count;
-use crate::r1cs_hashes::chain_common::{
-    ChainFold, assemble_chain_claim_at_offset,
-    fold_in_out_range,
-};
 use crate::r1cs_hashes::merkle_path_common::{
     MerklePathFold, assemble_merkle_path_claim_at_offset,
     fold_all_slots_range,
 };
 use crate::r1cs_hashes::sha2::{
-    CHAIN_LAYOUT, Compression, MERKLE_LAYOUT, SHA256_IV, Sha256HybridSetup,
+    Compression, MERKLE_LAYOUT, SHA256_IV, Sha256HybridSetup,
     generate_witness_with_ab_packed_and_lincheck, min_n_blocks_log,
 };
 use flock_core::challenger::{Challenger, FsChallenger};
@@ -61,7 +56,7 @@ use flock_core::pcs::{
 };
 
 use crate::mhot::merkle_membership::{
-    MhotMembershipInput, SOF_PACKED_BASE, build_content_hash_chain, digest_to_slot_f128, leaf_words_to_digest_bytes,
+    MhotMembershipInput, SOF_PACKED_BASE, digest_to_slot_f128,
     merkle_slot_pd_point, pad_to_needed, pd_point, route_sof_f128,
 };
 use crate::mhot::multiproof::{fork_pcs_challenger, open_core_ligerito};
@@ -114,19 +109,6 @@ pub fn prove_sound_multiproof(
     paths: &[Vec<MhotMembershipInput>],
     challenger: &mut FsChallenger,
 ) -> SoundMultiproof {
-    prove_sound_multiproof_impl(paths, &std::collections::HashMap::new(), challenger)
-}
-
-/// Implementation with a test-only seam: `chain_root_overrides` maps a
-/// unique-node index to a native_root substituted into that node's content-hash
-/// chain, decoupling it from the merkle base's authenticated tree. Empty in
-/// production; the forgery test uses it to exercise the merkle_root↔content_hash
-/// binding.
-pub(crate) fn prove_sound_multiproof_impl(
-    paths: &[Vec<MhotMembershipInput>],
-    chain_root_overrides: &std::collections::HashMap<usize, [u32; 8]>,
-    challenger: &mut FsChallenger,
-) -> SoundMultiproof {
     assert!(!paths.is_empty(), "need at least one path");
     for path in paths {
         assert!(!path.is_empty(), "each path must have at least one node");
@@ -156,16 +138,14 @@ pub(crate) fn prove_sound_multiproof_impl(
     let u = unique_nodes.len();
     eprintln!("[mem] after dedup ({} unique): {:.0} MB", u, vmrss_mb());
 
-    // -- Per-node: compute merkle + chain compressions and block counts --
+    // -- Per-node: compute in-node merkle compressions and block counts --
     let mut merkle_data: Vec<(Vec<Compression>, Vec<bool>, [u32; 8], [u32; 8], [u32; 8])> =
         Vec::with_capacity(u);
-    let mut chain_data: Vec<(Vec<Compression>, [u32; 8], [u32; 8], usize)> = Vec::with_capacity(u);
     let mut merkle_block_counts: Vec<usize> = Vec::with_capacity(u);
-    let mut chain_block_counts: Vec<usize> = Vec::with_capacity(u);
     let mut merkle_siblings: Vec<Vec<[u32; 8]>> = Vec::with_capacity(u);
     let mut merkle_sib_slots: Vec<Vec<usize>> = Vec::with_capacity(u);
 
-    for (node_idx, input) in unique_nodes.iter().enumerate() {
+    for (_node_idx, input) in unique_nodes.iter().enumerate() {
         let w = mhot_node_to_sha256_merkle(&input.node);
         let n_real_merkle = w.compressions.len();
         let mut compressions = w.compressions;
@@ -199,16 +179,6 @@ pub(crate) fn prove_sound_multiproof_impl(
 
         merkle_data.push((compressions, b_bits, w.leaf, padded_root, w.native_root));
         merkle_block_counts.push(needed);
-
-        let chain_native_root = chain_root_overrides
-            .get(&node_idx)
-            .copied()
-            .unwrap_or(w.native_root);
-        let merkle_root_bytes = leaf_words_to_digest_bytes(&chain_native_root);
-        let (chain_comps, content_hash, cv_last, n_real) =
-            build_content_hash_chain(&input.content, &merkle_root_bytes);
-        chain_data.push((chain_comps.clone(), content_hash, cv_last, n_real));
-        chain_block_counts.push(chain_comps.len());
     }
 
     // -- Pass 1: Merkle commitment --
@@ -292,57 +262,7 @@ pub(crate) fn prove_sound_multiproof_impl(
     );
     eprintln!("[mem] after merkle PCS open: {:.0} MB", vmrss_mb());
 
-    // -- Pass 2: Chain commitment --
-    let chain_alloc = allocate_blocks_aligned(&chain_block_counts);
-    eprintln!("[mem] chain alloc (n_log={}, {} blocks): {:.0} MB",
-        chain_alloc.n_log, chain_alloc.n_total, vmrss_mb());
-
-    let chain_comp_data: Vec<(Vec<Compression>, usize)> = (0..u)
-        .map(|i| (chain_data[i].0.clone(), chain_alloc.offsets[i]))
-        .collect();
-    let chain_comps = build_comp_vec(&chain_comp_data, chain_alloc.n_total);
-    drop(chain_comp_data);
-
-    let chain_setup = Sha256HybridSetup::cached(chain_alloc.n_total);
-    let (cz, ca, cb, czlc) =
-        generate_witness_with_ab_packed_and_lincheck(&chain_comps, chain_alloc.n_log);
-    drop(chain_comps);
-    let chain_core = prove_fast_core_with_block_count(
-        &chain_setup.r1cs, &chain_setup.pcs_params,
-        cz, ca, cb, czlc,
-        chain_setup.r1cs.csc_lincheck_circuit(),
-        Some(chain_alloc.n_real), challenger,
-    );
-    eprintln!("[mem] after chain prove_fast_core: {:.0} MB", vmrss_mb());
-
-    let chain_tau_pos = challenger.sample_f128_vec(CHAIN_LAYOUT.tau_pos_len());
-    let chain_fold = ChainFold::new(&CHAIN_LAYOUT, chain_tau_pos);
-
-    let mut chain_shifts = Vec::with_capacity(u);
-    let mut chain_pd_claims: Vec<PackedDirectClaim> = Vec::with_capacity(u);
-
-    for i in 0..u {
-        let (in_vals, out_vals) = fold_in_out_range(
-            &CHAIN_LAYOUT, &chain_core.z_packed, &chain_fold,
-            chain_alloc.offsets[i], chain_block_counts[i],
-        );
-        let (shift_proof, shift_claims) = prove_chain_shift(&in_vals, &out_vals, challenger);
-        let pd = assemble_chain_claim_at_offset(
-            &CHAIN_LAYOUT, &chain_fold, &shift_claims,
-            chain_alloc.offsets[i], chain_block_counts[i], chain_alloc.n_log,
-        );
-        chain_shifts.push(shift_proof);
-        chain_pd_claims.push(pd);
-    }
-
-    let mut chain_pcs_ch = fork_pcs_challenger(challenger, b"chain");
-    let chain_open = open_core_ligerito(
-        &chain_setup.r1cs, &chain_setup.pcs_params,
-        chain_core, chain_alloc.n_real, &chain_pd_claims, &mut chain_pcs_ch,
-    );
-    eprintln!("[mem] after chain PCS open: {:.0} MB", vmrss_mb());
-
-    // -- Pass 3: Route base (unchanged) --
+    // -- Pass 2: Route base (content_hash is verifier-recomputed, no chain SNARK) --
     let route_witnesses: Vec<route::RouteF32Witness> =
         unique_nodes.iter().map(|input| input.route_witness.clone()).collect();
     let n_routes = route_witnesses.len();
@@ -379,11 +299,6 @@ pub(crate) fn prove_sound_multiproof_impl(
         merkle_pcs: merkle_open.pcs_open,
         merkle_commitment: merkle_open.commitment,
 
-        chain_zc: chain_open.zc_proof,
-        chain_lc: chain_open.lc_proof,
-        chain_pcs: chain_open.pcs_open,
-        chain_commitment: chain_open.commitment,
-
         merkle_shifts,
         merkle_leaves: (0..u).map(|i| merkle_data[i].2).collect(),
         merkle_roots: (0..u).map(|i| merkle_data[i].3).collect(),
@@ -394,17 +309,9 @@ pub(crate) fn prove_sound_multiproof_impl(
             .collect(),
         content_metas: (0..u).map(|i| unique_nodes[i].content.clone()).collect(),
 
-        chain_shifts,
-        chain_content_hashes: (0..u).map(|i| chain_data[i].1).collect(),
-        chain_cv_lasts: (0..u).map(|i| chain_data[i].2).collect(),
-        chain_n_compressions: chain_block_counts.clone(),
-        chain_n_real: (0..u).map(|i| chain_data[i].3).collect(),
-
         merkle_block_offsets: merkle_alloc.offsets,
         merkle_block_counts,
-        chain_block_offsets: chain_alloc.offsets,
         n_log_merkle: merkle_alloc.n_log,
-        n_log_chain: chain_alloc.n_log,
 
         route_zc: route_open.zc_proof,
         route_lc: route_open.lc_proof,

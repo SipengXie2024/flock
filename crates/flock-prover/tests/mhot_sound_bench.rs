@@ -2,10 +2,21 @@ use std::time::Instant;
 
 use flock_core::challenger::FsChallenger;
 use flock_prover::mhot::{
-    merkle_membership::{ContentMeta, MhotMembershipInput, PathEntry, mhot_node_to_route_witness},
-    native_witness::MhotNodeWitness,
+    merkle_membership::{
+        ContentMeta, MhotMembershipInput, PathEntry, compute_content_hash,
+        mhot_node_to_route_witness,
+    },
+    native_witness::{MhotNodeWitness, mhot_node_to_sha256_merkle},
     sound_multiproof::{prove_sound_multiproof, verify_sound_multiproof_with_entries},
 };
+
+fn words_to_bytes(w: &[u32; 8]) -> [u8; 32] {
+    let mut b = [0u8; 32];
+    for i in 0..8 {
+        b[4 * i..4 * i + 4].copy_from_slice(&w[i].to_be_bytes());
+    }
+    b
+}
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -86,8 +97,17 @@ fn sound_vs_native_benchmark() {
         let proof = prove_sound_multiproof(&paths, &mut ch);
         let prove_ms = t0.elapsed().as_secs_f64() * 1e3;
 
-        let root_u = proof.path_mapping.node_indices[0][0];
-        let root = proof.chain_content_hashes[root_u];
+        // Public root = content_hash of the root node (verifier-recomputed;
+        // chain_content_hashes was deleted).
+        let root_node = &paths[0][0];
+        let root_native = mhot_node_to_sha256_merkle(&root_node.node).native_root;
+        let root_ch = compute_content_hash(&root_node.content, &words_to_bytes(&root_native));
+        let mut root = [0u32; 8];
+        for i in 0..8 {
+            root[i] = u32::from_be_bytes([
+                root_ch[4 * i], root_ch[4 * i + 1], root_ch[4 * i + 2], root_ch[4 * i + 3],
+            ]);
+        }
 
         // The benchmark measures the FULL membership statement — refuse to run
         // against an old-format export that lacks (key, value), rather than

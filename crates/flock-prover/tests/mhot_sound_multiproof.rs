@@ -29,6 +29,17 @@ fn node_content_hash_bytes(node: &MhotNodeWitness, content: &ContentMeta) -> [u8
     compute_content_hash(content, &merkle_root)
 }
 
+/// Public root = content_hash of the root node (chain_content_hashes was
+/// deleted; the verifier recomputes content_hash natively).
+fn root_of(input: &MhotMembershipInput) -> [u32; 8] {
+    let b = node_content_hash_bytes(&input.node, &input.content);
+    let mut w = [0u32; 8];
+    for i in 0..8 {
+        w[i] = u32::from_be_bytes([b[4 * i], b[4 * i + 1], b[4 * i + 2], b[4 * i + 3]]);
+    }
+    w
+}
+
 fn linked_inputs(fanouts: &[usize]) -> Vec<MhotMembershipInput> {
     let depth = fanouts.len();
     let mut inputs_rev = Vec::with_capacity(depth);
@@ -78,7 +89,7 @@ fn sound_multiproof_1_path() {
     let proof = prove_sound_multiproof(&paths, &mut ch);
     assert_eq!(proof.n_paths, 1);
     assert_eq!(proof.merkle_shifts.len(), 3);
-    let root = proof.chain_content_hashes[proof.path_mapping.node_indices[0][0]];
+    let root = root_of(&paths[0][0]);
     let mut chv = FsChallenger::new(b"smp-1path");
     let res = verify_sound_multiproof(&proof, &root, &mut chv);
     match &res {
@@ -104,7 +115,7 @@ fn sound_multiproof_4_paths_shared() {
     );
     assert_eq!(proof.n_routes, 3);
 
-    let root = proof.chain_content_hashes[proof.path_mapping.node_indices[0][0]];
+    let root = root_of(&paths[0][0]);
     let mut chv = FsChallenger::new(b"smp-4shared");
     verify_sound_multiproof(&proof, &root, &mut chv).expect("4 shared paths must verify");
 
@@ -118,16 +129,16 @@ fn sound_multiproof_tampered_content_hash() {
     let paths = vec![path];
     let mut ch = FsChallenger::new(b"smp-tamper-ch");
     let mut proof = prove_sound_multiproof(&paths, &mut ch);
-    let root = proof.chain_content_hashes[proof.path_mapping.node_indices[0][0]];
-    proof.chain_content_hashes[1][0] ^= 1;
+    let root = root_of(&paths[0][0]);
+    // content_hash is now verifier-computed from content_metas; tampering a
+    // non-root node's metadata changes its computed content_hash and breaks the
+    // cross-node binding to the parent's authenticated selected leaf.
+    proof.content_metas[1].child_leaf_counts[0] ^= 1;
     let mut chv = FsChallenger::new(b"smp-tamper-ch");
     match verify_sound_multiproof(&proof, &root, &mut chv) {
-        Err(MhotMembershipError::ContentHashMismatch { .. }) => {}
         Err(MhotMembershipError::CrossNodeBinding { .. }) => {}
-        // The merkle_root↔content_hash binding recompute now trips first: the
-        // tampered content_hash no longer matches SHA256(meta ‖ recomputed_root).
-        Err(MhotMembershipError::NativeRootMismatch { .. }) => {}
-        other => panic!("tampered content_hash must be rejected, got {other:?}"),
+        Err(MhotMembershipError::RootMismatch { .. }) => {}
+        other => panic!("tampered content_meta must be rejected, got {other:?}"),
     }
 }
 
@@ -137,7 +148,7 @@ fn sound_multiproof_wrong_root() {
     let paths = vec![path];
     let mut ch = FsChallenger::new(b"smp-wrong-root");
     let proof = prove_sound_multiproof(&paths, &mut ch);
-    let mut root = proof.chain_content_hashes[proof.path_mapping.node_indices[0][0]];
+    let mut root = root_of(&paths[0][0]);
     root[0] ^= 1;
     let mut chv = FsChallenger::new(b"smp-wrong-root");
     match verify_sound_multiproof(&proof, &root, &mut chv) {

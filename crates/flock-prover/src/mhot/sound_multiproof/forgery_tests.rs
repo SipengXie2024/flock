@@ -1,5 +1,5 @@
     use super::{
-        prove_sound_multiproof, prove_sound_multiproof_impl, verify_sound_multiproof,
+        bytes_to_words, prove_sound_multiproof, verify_sound_multiproof,
         verify_sound_multiproof_with_entries,
     };
     use crate::mhot::merkle_membership::{
@@ -8,7 +8,15 @@
     };
     use crate::mhot::native_witness::{mhot_node_to_sha256_merkle, MhotNodeWitness};
     use flock_core::challenger::FsChallenger;
-    use std::collections::HashMap;
+
+    /// The public root = content_hash of a node = SHA-256(content ‖ native_root).
+    fn node_root(input: &MhotMembershipInput) -> [u32; 8] {
+        let native = mhot_node_to_sha256_merkle(&input.node).native_root;
+        bytes_to_words(&compute_content_hash(
+            &input.content,
+            &leaf_words_to_digest_bytes(&native),
+        ))
+    }
 
     /// Two-node honest path whose ContentMetas genuinely route `entry.key`:
     /// root R (selects child 0 = T) → terminal T (selects child 1 = entry leaf).
@@ -56,7 +64,8 @@
     ) -> (super::SoundMultiproof, [u32; 8]) {
         let mut ch = FsChallenger::new(b"smp-entries");
         let proof = prove_sound_multiproof(paths, &mut ch);
-        let root = proof.chain_content_hashes[proof.path_mapping.node_indices[0][0]];
+        // Public root = content_hash of the root node (paths[0][0]).
+        let root = node_root(&paths[0][0]);
         (proof, root)
     }
 
@@ -221,15 +230,13 @@
         );
     }
 
-    /// Forgery: a malicious prover runs the merkle pass on a FAKE in-node tree
-    /// whose selected child is a non-member `L`, but runs the content-hash chain
-    /// on the REAL tree root (so content_hash matches what the root/parent demands).
-    /// The merkle base honestly authenticates `L → fake_root`; the chain commits
-    /// the real root; nothing compares the two → a non-member is accepted.
-    ///
-    /// Standard TDD red: asserts the forgery is REJECTED. Today verify returns Ok
-    /// (the bug) so this FAILS (red). After the fix the verifier recomputes the
-    /// committed tree's native_root and rejects → this PASSES (green).
+    /// Forgery: a malicious prover commits a FAKE in-node tree (selected child is
+    /// a non-member `L`) but claims the public root of the REAL tree. Since the
+    /// verifier COMPUTES content_hash from the committed tree (not from a
+    /// prover-supplied value — the chain SNARK was deleted), the fake tree's
+    /// content_hash ≠ the real tree's, so the root check rejects. This is the
+    /// binding the deleted chain base used to guard; it is now inherent because
+    /// nothing decouples content_hash from the committed merkle tree.
     #[test]
     fn forged_fake_merkle_real_root_rejected() {
         // Real node with genuine children.
@@ -246,7 +253,8 @@
             children: real_children.clone(),
             selected_child: selected,
         };
-        let r_real = mhot_node_to_sha256_merkle(&real_node).native_root;
+        let real_input = MhotMembershipInput::from_node(real_node);
+        let real_root = node_root(&real_input); // the public root of the REAL tree
 
         // Fake node: same shape, but the selected child is a non-member L.
         let mut fake_children = real_children;
@@ -255,21 +263,16 @@
             children: fake_children,
             selected_child: selected,
         };
+        let fake_input = MhotMembershipInput::from_node(fake_node);
 
-        // Prove: merkle pass on the FAKE tree, chain pass overridden to the REAL root.
-        let input = MhotMembershipInput::from_node(fake_node);
-        let overrides = HashMap::from([(0usize, r_real)]);
+        // Prove the FAKE tree, then claim the REAL tree's public root.
         let mut ch = FsChallenger::new(b"smp-forge");
-        let proof = prove_sound_multiproof_impl(&[vec![input]], &overrides, &mut ch);
-
-        // Public root = content_hash over the REAL root (self-consistent, as an
-        // honest parent would store it).
-        let root = proof.chain_content_hashes[0];
+        let proof = prove_sound_multiproof(&[vec![fake_input]], &mut ch);
         let mut chv = FsChallenger::new(b"smp-forge");
-        let res = verify_sound_multiproof(&proof, &root, &mut chv);
+        let res = verify_sound_multiproof(&proof, &real_root, &mut chv);
         assert!(
-            res.is_err(),
-            "forgery (fake merkle tree + real content_hash root) must be REJECTED; \
-             today it is accepted (the soundness bug). got {res:?}"
+            matches!(res, Err(MhotMembershipError::RootMismatch { .. })),
+            "fake in-node tree under the real tree's root must be REJECTED (verifier \
+             computes content_hash over the committed fake tree); got {res:?}"
         );
     }

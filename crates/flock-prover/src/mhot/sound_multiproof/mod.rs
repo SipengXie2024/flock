@@ -1,13 +1,9 @@
-use crate::chain::{ChainShiftProof, verify_chain_shift};
 use crate::merkle_path::{MerklePathShiftProof, verify_merkle_path_shift};
-use crate::r1cs_hashes::chain_common::{
-    ChainFold, build_chain_claim_point_at_offset,
-};
 use crate::r1cs_hashes::merkle_path_common::{
     MerklePathFold, build_merkle_claim_point_at_offset,
 };
 use crate::r1cs_hashes::sha2::{
-    CHAIN_LAYOUT, MERKLE_LAYOUT, SHA256_IV, Sha256HybridSetup, sha256_compress,
+    MERKLE_LAYOUT, Sha256HybridSetup,
 };
 use flock_core::challenger::{Challenger, FsChallenger};
 use flock_core::field::F128;
@@ -37,12 +33,6 @@ pub struct SoundMultiproof {
     pub merkle_pcs: BatchOpeningProofLigerito,
     pub merkle_commitment: Commitment,
 
-    // Chain base (separate commitment for content-hash chain compressions)
-    pub chain_zc: ZerocheckProof,
-    pub chain_lc: LincheckProof,
-    pub chain_pcs: BatchOpeningProofLigerito,
-    pub chain_commitment: Commitment,
-
     // Per-node merkle shift proofs
     pub merkle_shifts: Vec<MerklePathShiftProof>,
     pub merkle_leaves: Vec<[u32; 8]>,
@@ -50,24 +40,16 @@ pub struct SoundMultiproof {
     pub merkle_b_bits: Vec<Vec<bool>>,
     // Per-node authenticated in-node Merkle siblings (real depth), the true
     // depth-0 side bit, and content metadata — the verifier recomputes the
-    // committed tree's native_root and binds it to content_hash (soundness).
+    // committed tree's native_root and computes content_hash natively from it,
+    // binding it to the parent leaf / public root (no chain SNARK needed).
     pub merkle_siblings: Vec<Vec<[u32; 8]>>,
     pub merkle_leaf_is_right: Vec<bool>,
     pub content_metas: Vec<ContentMeta>,
 
-    // Per-node chain shift proofs
-    pub chain_shifts: Vec<ChainShiftProof>,
-    pub chain_content_hashes: Vec<[u32; 8]>,
-    pub chain_cv_lasts: Vec<[u32; 8]>,
-    pub chain_n_compressions: Vec<usize>,
-    pub chain_n_real: Vec<usize>,
-
     // Block layout metadata (verifier needs these for PD claim assembly)
     pub merkle_block_offsets: Vec<usize>,
     pub merkle_block_counts: Vec<usize>,
-    pub chain_block_offsets: Vec<usize>,
     pub n_log_merkle: usize,
-    pub n_log_chain: usize,
 
     // Route base (unchanged)
     pub route_zc: ZerocheckProof,
@@ -91,8 +73,6 @@ impl SoundMultiproof {
 mod prove;
 pub use prove::prove_sound_multiproof;
 pub(crate) use prove::bytes_to_words;
-#[cfg(test)]
-use prove::prove_sound_multiproof_impl;
 
 /// In-node binary-Merkle depth is `ceil(log2(fanout))`; fanout is capped at 32
 /// (native `dense_key` is `u32`), so depth never exceeds 5. Reject anything far
@@ -142,7 +122,6 @@ pub fn verify_sound_multiproof(
     // short Vec must be rejected cleanly, not panic (verifier DoS hardening —
     // load-bearing once SoundMultiproof gains a Deserialize path).
     if u == 0
-        || u != proof.chain_shifts.len()
         || u != proof.merkle_siblings.len()
         || u != proof.merkle_leaf_is_right.len()
         || u != proof.content_metas.len()
@@ -150,11 +129,6 @@ pub fn verify_sound_multiproof(
         || u != proof.merkle_block_counts.len()
         || u != proof.merkle_leaves.len()
         || u != proof.merkle_roots.len()
-        || u != proof.chain_content_hashes.len()
-        || u != proof.chain_cv_lasts.len()
-        || u != proof.chain_n_compressions.len()
-        || u != proof.chain_n_real.len()
-        || u != proof.chain_block_offsets.len()
         || u != proof.merkle_block_offsets.len()
     {
         return Err(MhotMembershipError::RootMismatch {
@@ -252,88 +226,27 @@ pub fn verify_sound_multiproof(
         &merkle_ab, &merkle_c, &merkle_pd_refs, &mut merkle_pcs_ch,
     ).map_err(MhotMembershipError::NodeVerify2)?;
 
-    // -- Bind committed merkle tree ↔ content_hash: recompute each node's true
-    //    native_root from its now-authenticated siblings and check content_hash
-    //    was actually built over that root. Closes the forgery where a fake
-    //    in-node tree is authenticated while content_hash commits a different
-    //    (real) root — the two were never compared before. --
+    // -- Node identity: recompute each node's content_hash natively from its
+    //    authenticated in-node tree (native_root from opened siblings) + the
+    //    content metadata. The verifier COMPUTES this rather than trusting a
+    //    prover-supplied value, so no separate SHA-256 chain SNARK is needed.
+    //    Committing a fake in-node tree or tampering content_metas changes the
+    //    computed content_hash and breaks the binding below (cross-node
+    //    parent-leaf / public root). --
+    let mut content_hashes: Vec<[u32; 8]> = Vec::with_capacity(u);
     for i in 0..u {
         let siblings = &proof.merkle_siblings[i];
         let depth = siblings.len();
         let sides: Vec<bool> = (0..depth).map(|d| authenticated_side(proof, i, d)).collect();
         let recomputed = recompute_native_root(&proof.merkle_leaves[i], siblings, &sides);
-        let expected_ch = compute_content_hash(
+        let ch = compute_content_hash(
             &proof.content_metas[i],
             &leaf_words_to_digest_bytes(&recomputed),
         );
-        if bytes_to_words(&expected_ch) != proof.chain_content_hashes[i] {
-            return Err(MhotMembershipError::NativeRootMismatch { node_idx: i });
-        }
+        content_hashes.push(bytes_to_words(&ch));
     }
 
     let t3 = std::time::Instant::now();
-    // -- Verify chain core --
-    let chain_n_total = 1usize << proof.n_log_chain;
-    let chain_setup = Sha256HybridSetup::cached(chain_n_total);
-    let (chain_ab, chain_c) = flock_core::verifier::verify_core(
-        &chain_setup.r1cs,
-        &proof.chain_zc, &proof.chain_lc, &proof.chain_commitment,
-        chain_setup.r1cs.csc_lincheck_circuit(),
-        challenger,
-    ).map_err(MhotMembershipError::NodeVerify2)?;
-
-    // -- Chain shifts --
-    let chain_tau_pos = challenger.sample_f128_vec(CHAIN_LAYOUT.tau_pos_len());
-    let chain_fold = ChainFold::new(&CHAIN_LAYOUT, chain_tau_pos);
-    let mut chain_pd_refs_data: Vec<(Vec<F128>, F128)> = Vec::with_capacity(u);
-
-    for i in 0..u {
-        let n_inst = proof.chain_n_compressions[i];
-        let inst_log = n_inst.trailing_zeros() as usize;
-        let iv_phys = crate::r1cs_hashes::sha2::cv_to_phys_bits(&SHA256_IV);
-        let x0_r = chain_fold.fold_public_phys(&iv_phys);
-        let cv_last_phys = crate::r1cs_hashes::sha2::cv_to_phys_bits(&proof.chain_cv_lasts[i]);
-        let xlast_r = chain_fold.fold_public_phys(&cv_last_phys);
-
-        let claims = verify_chain_shift(
-            &proof.chain_shifts[i], x0_r, xlast_r, inst_log, challenger,
-        ).map_err(|e| MhotMembershipError::NodeVerify2(
-            flock_core::verifier::VerifyError::Wiring(format!("chain shift {i}: {e:?}"))
-        ))?;
-
-        let point = build_chain_claim_point_at_offset(
-            &CHAIN_LAYOUT, &chain_fold, &claims,
-            proof.chain_block_offsets[i], proof.chain_n_compressions[i],
-            proof.n_log_chain,
-        );
-        chain_pd_refs_data.push((point, claims.value));
-
-        if proof.chain_n_real[i] > n_inst {
-            return Err(MhotMembershipError::ContentHashMismatch { node_idx: i });
-        }
-        let n_pad = n_inst - proof.chain_n_real[i];
-        let mut expected_cv = proof.chain_content_hashes[i];
-        for _ in 0..n_pad {
-            expected_cv = sha256_compress(&expected_cv, &[0u32; 16]);
-        }
-        if expected_cv != proof.chain_cv_lasts[i] {
-            return Err(MhotMembershipError::ContentHashMismatch { node_idx: i });
-        }
-    }
-
-    let t4 = std::time::Instant::now();
-    // -- Chain PCS verify (forked challenger) --
-    let chain_pd_refs: Vec<PackedDirectClaimRef> = chain_pd_refs_data
-        .iter().map(|(p, v)| PackedDirectClaimRef { point: p, value: *v }).collect();
-
-    let mut chain_pcs_ch = fork_pcs_challenger(challenger, b"chain");
-    verify_core_opening_ligerito(
-        &chain_setup.r1cs, &chain_setup.pcs_params,
-        &proof.chain_commitment, &proof.chain_pcs,
-        &chain_ab, &chain_c, &chain_pd_refs, &mut chain_pcs_ch,
-    ).map_err(MhotMembershipError::NodeVerify2)?;
-
-    let t5 = std::time::Instant::now();
     // -- Cross-node binding (per path) --
     for (p, indices) in proof.path_mapping.node_indices.iter().enumerate() {
         if p >= proof.path_depths.len() || indices.len() != proof.path_depths[p] {
@@ -350,7 +263,7 @@ pub fn verify_sound_multiproof(
                 });
             }
             let parent_leaf = proof.merkle_leaves[parent_u];
-            let child_content = proof.chain_content_hashes[child_u];
+            let child_content = content_hashes[child_u];
             if parent_leaf != child_content {
                 return Err(MhotMembershipError::CrossNodeBinding {
                     parent_idx: parent_u,
@@ -374,15 +287,14 @@ pub fn verify_sound_multiproof(
                 expected: *expected_root, actual: [0; 8],
             });
         }
-        if proof.chain_content_hashes[root_u] != *expected_root {
+        if content_hashes[root_u] != *expected_root {
             return Err(MhotMembershipError::RootMismatch {
                 expected: *expected_root,
-                actual: proof.chain_content_hashes[root_u],
+                actual: content_hashes[root_u],
             });
         }
     }
 
-    let t6 = std::time::Instant::now();
     // -- Route verify core --
     let route_setup = RouteF32Setup::cached(proof.n_routes);
     let (route_ab, route_c) = flock_core::verifier::verify_core(
@@ -412,8 +324,8 @@ pub fn verify_sound_multiproof(
     let t7 = std::time::Instant::now();
     if vt {
         let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
-        eprintln!("[verify] merkle_core={:.1}ms merkle_shifts={:.1}ms merkle_pcs+recompute={:.1}ms chain_core+shifts={:.1}ms chain_pcs={:.1}ms cross+root={:.1}ms route={:.1}ms total={:.1}ms",
-            ms(t1-t0), ms(t2-t1), ms(t3-t2), ms(t4-t3), ms(t5-t4), ms(t6-t5), ms(t7-t6), ms(t7-t0));
+        eprintln!("[verify] merkle_core={:.1}ms merkle_shifts={:.1}ms merkle_pcs+recompute={:.1}ms cross+root+route={:.1}ms total={:.1}ms",
+            ms(t1-t0), ms(t2-t1), ms(t3-t2), ms(t7-t3), ms(t7-t0));
     }
     Ok(())
 }

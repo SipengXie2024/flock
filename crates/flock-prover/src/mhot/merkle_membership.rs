@@ -34,10 +34,6 @@ pub enum MhotMembershipError {
         expected: [u32; 8],
         actual: [u32; 8],
     },
-    /// The committed in-node Merkle tree's recomputed native_root is inconsistent
-    /// with the root that content_hash committed to (the merkle_root↔content_hash
-    /// binding).
-    NativeRootMismatch { node_idx: usize },
     /// Number of public entries does not match the number of proven paths.
     EntryCountMismatch { n_entries: usize, n_paths: usize },
     /// The public key does not route to the authenticated child position at
