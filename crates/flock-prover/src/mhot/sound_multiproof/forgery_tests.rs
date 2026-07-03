@@ -457,25 +457,10 @@
         expect_malformed(&proof, &root, b"smp-dos-nroutes", "n_routes+1");
     }
 
-    /// Block offsets are prover-chosen wire numbers; the claim-point assembly
-    /// consumes them raw. They must be aligned to their (power-of-two) count —
-    /// the invariant `allocate_blocks_aligned` guarantees for honest proofs.
-    #[test]
-    fn dos_gate_offset_misaligned_rejected() {
-        let (mut proof, root) = dos_proof(b"smp-dos-off-align");
-        proof.merkle_block_offsets[0] += 1;
-        expect_malformed(&proof, &root, b"smp-dos-off-align", "misaligned offset");
-    }
-
-    /// An offset past the committed range would place the PD claim outside the
-    /// commitment (and lets offset+count overflow-wrap on adversarial values).
-    #[test]
-    fn dos_gate_offset_out_of_range_rejected() {
-        let (mut proof, root) = dos_proof(b"smp-dos-off-range");
-        // Aligned (2^n_log is a multiple of the count) but end > 1 << n_log.
-        proof.merkle_block_offsets[0] = 1usize << proof.n_log_merkle;
-        expect_malformed(&proof, &root, b"smp-dos-off-range", "out-of-range offset");
-    }
+    // (E2: the offset-misaligned / offset-out-of-range DoS tests are gone —
+    // merkle_block_offsets was deleted; offsets are DERIVED `off_i = i·8` under
+    // the uniform-8 layout, so there is no prover-chosen offset to tamper. The
+    // canonical n_log gate (`8u → pow2`) subsumes the range check.)
 
     /// Every pair must reference a valid physical-node entry; an out-of-range
     /// pair_phys index must be gated before any indexed use.
@@ -552,7 +537,7 @@
         let root = node_root(&i0);
         let mut ch = FsChallenger::new(b"smp-shared-phys");
         let proof = prove_sound_multiproof(&[vec![i0], vec![i1]], &mut ch);
-        assert_eq!(proof.merkle_shifts.len(), 2, "two pairs");
+        assert_eq!(proof.merkle_leaves.len(), 2, "two pairs");
         assert_eq!(proof.merkle_roots.len(), 1, "one shared physical node");
         assert_eq!(proof.pair_phys, vec![0, 0]);
         let mut chv = FsChallenger::new(b"smp-shared-phys");

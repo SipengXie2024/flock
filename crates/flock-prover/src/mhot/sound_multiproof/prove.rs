@@ -11,6 +11,24 @@ fn vmrss_mb() -> f64 {
         .unwrap_or(0.0) / 1024.0
 }
 
+/// The canonical deterministic dummy node filling padding slots `[u, P)` so the
+/// global shift runs over the full `2^m`-node cube. Both prover and verifier
+/// build the IDENTICAL chain (a fanout-2 node with zero-digest children,
+/// native-order, padded to 8 blocks), so padding cannot be a prover-chosen
+/// cancellation reservoir. Returns `(compressions[8], b_bits[8], leaf digest,
+/// padded-root digest)`.
+pub(crate) fn dummy_padding_chain() -> (Vec<Compression>, Vec<bool>, [u32; 8], [u32; 8]) {
+    let node = crate::mhot::native_witness::MhotNodeWitness {
+        children: vec![[0u8; 32], [0u8; 32]],
+        selected_child: 0,
+    };
+    let w = mhot_node_to_sha256_merkle(&node, true);
+    let mut compressions = w.compressions;
+    let mut b_bits = w.b_bits;
+    let padded_root = pad_to_needed(&mut compressions, &mut b_bits, super::MERKLE_BLOCKS_PER_NODE);
+    (compressions, b_bits, w.leaf, padded_root)
+}
+
 pub(crate) fn bytes_to_words(b: &[u8; 32]) -> [u32; 8] {
     let mut w = [0u32; 8];
     for i in 0..8 {
@@ -55,8 +73,7 @@ fn pair_identity(input: &MhotMembershipInput) -> Vec<u8> {
 use crate::merkle_path::prove_merkle_path_shift;
 use crate::prover::prove_fast_core_with_block_count;
 use crate::r1cs_hashes::merkle_path_common::{
-    MerklePathFold, assemble_merkle_path_claim_at_offset,
-    fold_all_slots_range,
+    MerklePathFold, assemble_merkle_path_claim, fold_all_slots,
 };
 use crate::r1cs_hashes::sha2::{
     Compression, MERKLE_LAYOUT, SHA256_IV, Sha256HybridSetup,
@@ -83,24 +100,20 @@ struct AlignedAllocation {
     n_log: usize,
 }
 
-fn allocate_blocks_aligned(block_counts: &[usize]) -> AlignedAllocation {
-    let u = block_counts.len();
-    let mut indices: Vec<usize> = (0..u).collect();
-    indices.sort_by(|&a, &b| block_counts[b].cmp(&block_counts[a]));
-
-    let mut offsets = vec![0usize; u];
-    let mut cursor = 0usize;
-    for &i in &indices {
-        let align = block_counts[i];
-        cursor = (cursor + align - 1) & !(align - 1);
-        offsets[i] = cursor;
-        cursor += block_counts[i];
-    }
-    let n_real = cursor;
+/// Uniform-8 block allocation (E2): every node's chain is exactly 8 blocks
+/// (see `MERKLE_BLOCKS_PER_NODE`), so `off_i = i·8` and the committed cube is
+/// `P × 8` blocks where `P = n_total/8` is a power of two. Real nodes fill
+/// `[0, u)`; `[u, P)` are deterministic dummy padding nodes.
+fn allocate_blocks_uniform(u: usize) -> AlignedAllocation {
+    let block = super::MERKLE_BLOCKS_PER_NODE;
+    let offsets: Vec<usize> = (0..u).map(|i| i * block).collect();
     let min_n = 1usize << (22 - crate::r1cs_hashes::sha2::K_LOG);
-    let n_total = cursor.max(min_n).next_power_of_two();
+    let n_total = (u * block).max(min_n).next_power_of_two();
     let n_log = n_total.trailing_zeros() as usize;
-    AlignedAllocation { offsets, n_real, n_total, n_log }
+    // Padding slots [u, P) are filled with VALID dummy chains (not zero rows),
+    // so ALL n_total blocks are real compressions for the zerocheck — n_real =
+    // n_total (no zero-padding region). The global shift needs every node.
+    AlignedAllocation { offsets, n_real: n_total, n_total, n_log }
 }
 
 fn build_comp_vec(
@@ -192,13 +205,22 @@ pub fn prove_sound_multiproof(
     );
 
     // -- Pass 1: Merkle commitment --
-    let merkle_alloc = allocate_blocks_aligned(&merkle_block_counts);
-    eprintln!("[mem] merkle alloc (n_log={}, {} blocks): {:.0} MB",
-        merkle_alloc.n_log, merkle_alloc.n_total, vmrss_mb());
+    let merkle_alloc = allocate_blocks_uniform(u);
+    let block = super::MERKLE_BLOCKS_PER_NODE;
+    let p_nodes = merkle_alloc.n_total / block; // 2^m, real [0,u) + padding [u,P)
+    eprintln!("[mem] merkle alloc (n_log={}, {} blocks, {} nodes): {:.0} MB",
+        merkle_alloc.n_log, merkle_alloc.n_total, p_nodes, vmrss_mb());
 
-    let merkle_comp_data: Vec<(Vec<Compression>, usize)> = (0..u)
+    // Padding nodes [u, P) get the deterministic dummy chain so the global
+    // shift runs over the whole power-of-two node cube (a valid chain, not the
+    // build_comp_vec IV-filler which satisfies the R1CS but NOT the shift link).
+    let (dummy_comps, dummy_b, _dummy_leaf, _dummy_root) = dummy_padding_chain();
+    let mut merkle_comp_data: Vec<(Vec<Compression>, usize)> = (0..u)
         .map(|i| (merkle_data[i].0.clone(), merkle_alloc.offsets[i]))
         .collect();
+    for node in u..p_nodes {
+        merkle_comp_data.push((dummy_comps.clone(), node * block));
+    }
     let merkle_comps = build_comp_vec(&merkle_comp_data, merkle_alloc.n_total);
     drop(merkle_comp_data);
 
@@ -220,40 +242,39 @@ pub fn prove_sound_multiproof(
     let merkle_tau_pos = challenger.sample_f128_vec(MERKLE_LAYOUT.tau_pos_len());
     let merkle_fold = MerklePathFold::new(&MERKLE_LAYOUT, merkle_tau_pos);
 
-    let mut merkle_shifts = Vec::with_capacity(u);
-    let mut merkle_pd_claims: Vec<PackedDirectClaim> = Vec::with_capacity(u);
-
+    // ONE global shift over the full P-node cube. Fold every block's slots at
+    // once (whole witness), then prove_merkle_path_shift(path_log = log2(P)):
+    // the node dimension is batched via τ_p = η, each node carrying its own
+    // root/leaf. b_bits is N-major (node N's 8 side bits at [N·8, N·8+8)).
+    let slots = fold_all_slots(&MERKLE_LAYOUT, &merkle_core.z_packed, &merkle_fold);
+    let mut b_bits_full = vec![false; merkle_alloc.n_total];
     for i in 0..u {
-        let slots = fold_all_slots_range(
-            &MERKLE_LAYOUT, &merkle_core.z_packed, &merkle_fold,
-            merkle_alloc.offsets[i], merkle_block_counts[i],
-        );
-        let n_inst = merkle_block_counts[i];
-        let mut b_bits_padded = merkle_data[i].1.clone();
-        b_bits_padded.resize(n_inst, false);
-
-        let (shift_proof, shift_claims) = prove_merkle_path_shift(
-            0,
-            &slots[MERKLE_LAYOUT.x_l_slot as usize],
-            &slots[MERKLE_LAYOUT.x_r_slot as usize],
-            &slots[MERKLE_LAYOUT.z_slot as usize],
-            &slots[MERKLE_LAYOUT.other_slot() as usize],
-            &b_bits_padded,
-            MERKLE_LAYOUT.slot_layout(),
-            challenger,
-        );
-        let pd = assemble_merkle_path_claim_at_offset(
-            &MERKLE_LAYOUT, &merkle_fold, &shift_claims,
-            merkle_alloc.offsets[i], merkle_block_counts[i], merkle_alloc.n_log,
-        );
-        merkle_shifts.push(shift_proof);
-        merkle_pd_claims.push(pd);
+        for (y, &bit) in merkle_data[i].1.iter().enumerate() {
+            b_bits_full[i * block + y] = bit;
+        }
     }
+    for node in u..p_nodes {
+        for (y, &bit) in dummy_b.iter().enumerate() {
+            b_bits_full[node * block + y] = bit;
+        }
+    }
+    let path_log = merkle_alloc.n_log - block.trailing_zeros() as usize; // log2(P)
+    let (merkle_shift, shift_claims) = prove_merkle_path_shift(
+        path_log,
+        &slots[MERKLE_LAYOUT.x_l_slot as usize],
+        &slots[MERKLE_LAYOUT.x_r_slot as usize],
+        &slots[MERKLE_LAYOUT.z_slot as usize],
+        &slots[MERKLE_LAYOUT.other_slot() as usize],
+        &b_bits_full,
+        MERKLE_LAYOUT.slot_layout(),
+        challenger,
+    );
+    let merkle_pd = assemble_merkle_path_claim(&MERKLE_LAYOUT, &merkle_fold, &shift_claims);
 
     let mut merkle_pcs_ch = fork_pcs_challenger(challenger, b"merkle");
     let merkle_open = open_core_ligerito(
         &merkle_setup.r1cs, &merkle_setup.pcs_params,
-        merkle_core, merkle_alloc.n_real, &merkle_pd_claims, &mut merkle_pcs_ch,
+        merkle_core, merkle_alloc.n_real, std::slice::from_ref(&merkle_pd), &mut merkle_pcs_ch,
     );
     eprintln!("[mem] after merkle PCS open: {:.0} MB", vmrss_mb());
 
@@ -316,7 +337,7 @@ pub fn prove_sound_multiproof(
         merkle_pcs: merkle_open.pcs_open,
         merkle_commitment: merkle_open.commitment,
 
-        merkle_shifts,
+        merkle_shift,
         merkle_leaves: (0..u).map(|i| merkle_data[i].2).collect(),
         merkle_roots: phys_roots,
         merkle_b_bits: (0..u).map(|i| merkle_data[i].1.clone()).collect(),
@@ -324,7 +345,6 @@ pub fn prove_sound_multiproof(
         content_metas: phys_metas.into_iter().map(|m| m.expect("every phys referenced")).collect(),
         pair_phys,
 
-        merkle_block_offsets: merkle_alloc.offsets,
         merkle_block_counts: phys_block_counts,
         n_log_merkle: merkle_alloc.n_log,
 

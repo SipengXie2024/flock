@@ -1,6 +1,6 @@
 use crate::merkle_path::{MerklePathShiftProof, verify_merkle_path_shift};
 use crate::r1cs_hashes::merkle_path_common::{
-    MerklePathFold, build_merkle_claim_point_at_offset,
+    MerklePathFold, build_merkle_claim_point,
 };
 use crate::r1cs_hashes::sha2::{
     MERKLE_LAYOUT, SHA256_IV, Sha256HybridSetup, sha256_compress,
@@ -34,13 +34,16 @@ pub struct SoundMultiproof {
     pub merkle_pcs: BatchOpeningProofLigerito,
     pub merkle_commitment: Commitment,
 
+    // ONE global shift-sumcheck over the full `node × 8 × slot` cube (E2):
+    // `m + 5` rounds batch all u pairs (+ deterministic padding to 2^m nodes)
+    // via τ_p = η, replacing the u per-pair shifts (~2.7MB → ~m·48B).
+    pub merkle_shift: MerklePathShiftProof,
+
     // Per-PAIR data (u = number of unique (node, selected-child) pairs):
-    // the shift authenticates the selected leaf's chain, so leaf, side bits,
-    // shift proof and the chain's block offset are keyed by pair.
-    pub merkle_shifts: Vec<MerklePathShiftProof>,
+    // the shift authenticates each pair's selected leaf, so leaf and side bits
+    // are keyed by pair. Block offsets are derived (`off_i = i·8`, uniform-8).
     pub merkle_leaves: Vec<[u32; 8]>,
     pub merkle_b_bits: Vec<Vec<bool>>,
-    pub merkle_block_offsets: Vec<usize>,
     /// pair → physical-node index into the per-physical vectors below. Two
     /// queries traversing the same tree node toward different children share
     /// one physical entry (tree-determined data) but keep distinct pair data.
@@ -153,7 +156,7 @@ pub fn verify_sound_multiproof(
     expected_root: &[u32; 8],
     challenger: &mut FsChallenger,
 ) -> Result<(), MhotMembershipError> {
-    let u = proof.merkle_shifts.len();
+    let u = proof.merkle_leaves.len();
     let n_phys = proof.merkle_roots.len();
     // Every per-pair Vec is indexed at [0..u) and every per-physical Vec at
     // [0..n_phys) below; a malformed proof with a short Vec must be rejected
@@ -161,8 +164,6 @@ pub fn verify_sound_multiproof(
     // SoundMultiproof gains a Deserialize path).
     if u == 0
         || u != proof.merkle_b_bits.len()
-        || u != proof.merkle_leaves.len()
-        || u != proof.merkle_block_offsets.len()
         || u != proof.pair_phys.len()
         || n_phys == 0
         || n_phys != proof.merkle_native_roots.len()
@@ -237,34 +238,15 @@ pub fn verify_sound_multiproof(
                 reason: "pair_phys index out of range",
             });
         }
-        // Offsets are prover-chosen; unaligned or out-of-range values would
-        // alias the PD claim point inside the 2^n_log space (bit decomposition
-        // wraps) or overflow offset+count. Honest offsets come from
-        // allocate_blocks_aligned: aligned to their own (power-of-two) count
-        // and contained in the committed range.
-        let off = proof.merkle_block_offsets[i];
-        let cnt = proof.merkle_block_counts[proof.pair_phys[i]];
-        if off % cnt != 0
-            || off
-                .checked_add(cnt)
-                .map_or(true, |end| end > 1usize << proof.n_log_merkle)
-        {
-            return Err(MhotMembershipError::MalformedProof {
-                reason: "block offset misaligned or out of committed range",
-            });
-        }
     }
-    // Canonical-recompute gate: n_log_merkle must be EXACTLY what
-    // allocate_blocks_aligned derives from the (now-validated) offsets and
-    // counts — max end, floored at 1 << (22 - K_LOG), rounded to a power of
-    // two. This pins the setup allocation size to the wire's real span.
+    // Canonical-recompute gate (uniform-8): offsets are DERIVED (`off_i = i·8`),
+    // not carried, so n_log_merkle must be EXACTLY `next_pow2(max(8u, min_n))`.
+    // This pins the setup allocation size to u; a wrong n_log is rejected before
+    // `Sha256HybridSetup::cached` sizes an allocation from it.
     {
-        let max_end = (0..u)
-            .map(|i| proof.merkle_block_offsets[i] + proof.merkle_block_counts[proof.pair_phys[i]])
-            .max()
-            .expect("u > 0 gated above");
         let min_n = 1usize << (22 - crate::r1cs_hashes::sha2::K_LOG);
-        if 1usize << proof.n_log_merkle != max_end.max(min_n).next_power_of_two() {
+        let n_real = u * MERKLE_BLOCKS_PER_NODE;
+        if 1usize << proof.n_log_merkle != n_real.max(min_n).next_power_of_two() {
             return Err(MhotMembershipError::MalformedProof {
                 reason: "n_log_merkle != canonical allocation size",
             });
@@ -285,42 +267,62 @@ pub fn verify_sound_multiproof(
     ).map_err(MhotMembershipError::NodeVerify2)?;
 
     let t1 = std::time::Instant::now();
-    // -- Merkle shifts --
+    // -- ONE global merkle shift over the full P-node cube (E2) --
     let merkle_tau_pos = challenger.sample_f128_vec(MERKLE_LAYOUT.tau_pos_len());
     let merkle_fold = MerklePathFold::new(&MERKLE_LAYOUT, merkle_tau_pos);
-    let mut merkle_pd_refs_data: Vec<(Vec<F128>, F128)> = Vec::with_capacity(u);
 
+    let block = MERKLE_BLOCKS_PER_NODE;
+    let p_nodes = merkle_n_total / block; // 2^m
+    let fold_digest = |d: &[u32; 8]| -> F128 {
+        merkle_fold.fold_public_phys(&crate::r1cs_hashes::sha2::hash_to_phys_bits(d))
+    };
+    // Per-node public leaf / root, folded. Real nodes [0,u); padding [u,P) get
+    // the deterministic dummy chain the prover committed — the verifier rebuilds
+    // it identically, so padding cannot be a prover-chosen cancellation lever.
+    let (_dummy_comps, dummy_b, dummy_leaf, dummy_root) = prove::dummy_padding_chain();
+    let dummy_leaf_r = fold_digest(&dummy_leaf);
+    let dummy_root_r = fold_digest(&dummy_root);
+    let mut leaf_evals = Vec::with_capacity(p_nodes);
+    let mut root_evals = Vec::with_capacity(p_nodes);
+    let mut b_bits_full = vec![false; merkle_n_total];
     for i in 0..u {
-        let n_inst = proof.merkle_block_counts[proof.pair_phys[i]];
-        let inst_log = n_inst.trailing_zeros() as usize;
-        let leaf_phys = crate::r1cs_hashes::sha2::hash_to_phys_bits(&proof.merkle_leaves[i]);
-        let leaf_r = merkle_fold.fold_public_phys(&leaf_phys);
-        let root_phys =
-            crate::r1cs_hashes::sha2::hash_to_phys_bits(&proof.merkle_roots[proof.pair_phys[i]]);
-        let root_r = merkle_fold.fold_public_phys(&root_phys);
-
-        let mut b_bits_padded = proof.merkle_b_bits[i].clone();
-        b_bits_padded.resize(n_inst, false);
-
-        let claims = verify_merkle_path_shift(
-            0, &proof.merkle_shifts[i], &[leaf_r], &[root_r],
-            &b_bits_padded, inst_log, MERKLE_LAYOUT.slot_layout(), challenger,
-        ).map_err(|e| MhotMembershipError::NodeVerify2(
-            flock_core::verifier::VerifyError::Wiring(format!("merkle shift {i}: {e:?}"))
-        ))?;
-
-        let point = build_merkle_claim_point_at_offset(
-            &MERKLE_LAYOUT, &merkle_fold, &claims,
-            proof.merkle_block_offsets[i], n_inst,
-            proof.n_log_merkle,
-        );
-        merkle_pd_refs_data.push((point, claims.value));
+        leaf_evals.push(fold_digest(&proof.merkle_leaves[i]));
+        root_evals.push(fold_digest(&proof.merkle_roots[proof.pair_phys[i]]));
+        for (y, &bit) in proof.merkle_b_bits[i].iter().enumerate() {
+            if y < block {
+                b_bits_full[i * block + y] = bit;
+            }
+        }
+    }
+    for node in u..p_nodes {
+        leaf_evals.push(dummy_leaf_r);
+        root_evals.push(dummy_root_r);
+        for (y, &bit) in dummy_b.iter().enumerate() {
+            b_bits_full[node * block + y] = bit;
+        }
     }
 
+    let path_log = proof.n_log_merkle - block.trailing_zeros() as usize;
+    let claims = verify_merkle_path_shift(
+        path_log,
+        &proof.merkle_shift,
+        &leaf_evals,
+        &root_evals,
+        &b_bits_full,
+        proof.n_log_merkle,
+        MERKLE_LAYOUT.slot_layout(),
+        challenger,
+    )
+    .map_err(|e| {
+        MhotMembershipError::NodeVerify2(flock_core::verifier::VerifyError::Wiring(format!(
+            "global merkle shift: {e:?}"
+        )))
+    })?;
+
     let t2 = std::time::Instant::now();
-    // -- Merkle PCS verify (forked challenger) --
-    let merkle_pd_refs: Vec<PackedDirectClaimRef> = merkle_pd_refs_data
-        .iter().map(|(p, v)| PackedDirectClaimRef { point: p, value: *v }).collect();
+    // -- Merkle PCS verify (forked challenger): ONE global PD claim --
+    let point = build_merkle_claim_point(&MERKLE_LAYOUT, &merkle_fold, &claims);
+    let merkle_pd_refs = [PackedDirectClaimRef { point: &point, value: claims.value }];
 
     let mut merkle_pcs_ch = fork_pcs_challenger(challenger, b"merkle");
     verify_core_opening_ligerito(
@@ -488,8 +490,8 @@ pub fn verify_sound_multiproof_with_entries(
 
     verify_sound_multiproof(proof, expected_root, challenger)?;
 
-    // Authenticated selected-child index per unique node (depends only on u_i).
-    let selected: Vec<usize> = (0..proof.merkle_shifts.len())
+    // Authenticated selected-child index per unique pair (depends only on u_i).
+    let selected: Vec<usize> = (0..proof.merkle_leaves.len())
         .map(|i| selected_index(proof, i))
         .collect();
 

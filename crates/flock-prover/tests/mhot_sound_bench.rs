@@ -74,13 +74,16 @@ fn sound_vs_native_benchmark() {
         "N", "nmulti_KB", "flock_KB", "ratio", "nv_mul_ms", "fp_ms", "fv_ms", "unique");
     eprintln!("{}", "-".repeat(80));
 
-    // BENCH_NS=8192 (comma-separated) runs a chosen subset — peak-memory
-    // acceptance numbers must come from a standalone single-N process, not
-    // mid-sweep.
+    // BENCH_NS=8192 (comma-separated) runs a chosen subset. N=8192 is EXCLUDED
+    // from the default set: it holds ~10-13 GB and, when this bench runs
+    // concurrently with the other heavy integration binaries under `cargo test`,
+    // exhausts the box (a thread's stack can't fault in → "stack overflow").
+    // Peak-memory + N≥8192 numbers must come from a standalone single-N process
+    // anyway (BENCH_NS=8192), so the default stays at the co-runnable sizes.
     let ns: Vec<usize> = std::env::var("BENCH_NS")
         .ok()
         .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect())
-        .unwrap_or_else(|| vec![256, 1024, 4096, 8192]);
+        .unwrap_or_else(|| vec![256, 1024, 4096]);
     for &n in &ns {
         let filename = format!("/tmp/mhot_export_n{}.json", n);
         let json = match std::fs::read_to_string(&filename) {

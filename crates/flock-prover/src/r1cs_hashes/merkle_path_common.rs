@@ -355,7 +355,7 @@ pub fn assemble_merkle_path_claim_at_offset(
 
 /// Verifier-side helper: build the claim point identically to
 /// [`assemble_merkle_path_claim`] without constructing the sparse eq tensor.
-fn build_merkle_claim_point(
+pub(crate) fn build_merkle_claim_point(
     layout: &MerkleLayout,
     fold: &MerklePathFold,
     claims: &crate::merkle_path::MerklePathClaims,
