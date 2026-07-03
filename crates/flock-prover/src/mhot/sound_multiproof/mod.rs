@@ -134,6 +134,63 @@ fn authenticated_side(proof: &SoundMultiproof, i: usize, d: usize) -> bool {
     proof.merkle_b_bits[i].get(d).copied().unwrap_or(false)
 }
 
+/// FS Step 0 (E2 global batching): absorb the public IO that defines the global
+/// shift's per-node error vector `e_N` BEFORE the shift challenge (τ_p = η) is
+/// sampled. The batching's cross-node-cancellation resistance (Schwartz-Zippel,
+/// ~m/|F|) needs `e_N` FIXED before η, or a char-2 prover could pick these after
+/// seeing η to force `Σ_N eq(η,N)·e_N = 0`.
+///
+/// `e_N` depends ONLY on the committed trace `G` (fixed by the commitment) and
+/// the shift's public inputs: the padded `roots` R(η), `leaves` L(η), side bits
+/// `b_bits` B(N,Y), and `pair_phys` (which routes root_N = roots[pair_phys[N]]),
+/// plus `n_log_merkle` (the domain size P) and `n_routes`. So ONLY those are
+/// absorbed. `native_roots`, `content_metas`, `path_mapping`, and `entries` feed
+/// DETERMINISTIC downstream checks (pad-forward, cross-node, routing, terminal
+/// leaf) that consume no challenge — they are bound to `expected_root` by those
+/// equalities regardless of η, so they stay outside Step 0 (and their tamper
+/// tests keep exercising those specific checks). Prover and verifier build
+/// byte-identical input; a divergence fails the honest roundtrip immediately.
+pub(crate) fn absorb_public_io<Ch: Challenger>(
+    ch: &mut Ch,
+    leaves: &[[u32; 8]],
+    b_bits: &[Vec<bool>],
+    pair_phys: &[usize],
+    roots: &[[u32; 8]],
+    n_log_merkle: usize,
+    n_routes: usize,
+) {
+    let mut buf: Vec<u8> = Vec::new();
+    let u64le = |b: &mut Vec<u8>, v: usize| b.extend_from_slice(&(v as u64).to_le_bytes());
+    let digest = |b: &mut Vec<u8>, d: &[u32; 8]| {
+        for w in d {
+            b.extend_from_slice(&w.to_le_bytes());
+        }
+    };
+    u64le(&mut buf, leaves.len());
+    for l in leaves {
+        digest(&mut buf, l);
+    }
+    u64le(&mut buf, b_bits.len());
+    for bb in b_bits {
+        u64le(&mut buf, bb.len());
+        for &bit in bb {
+            buf.push(bit as u8);
+        }
+    }
+    u64le(&mut buf, pair_phys.len());
+    for &p in pair_phys {
+        u64le(&mut buf, p);
+    }
+    u64le(&mut buf, roots.len());
+    for r in roots {
+        digest(&mut buf, r);
+    }
+    u64le(&mut buf, n_log_merkle);
+    u64le(&mut buf, n_routes);
+    ch.observe_label(b"mhot-sound-public-io-v0");
+    ch.observe_bytes(&buf);
+}
+
 /// The authenticated selected-child index of pair `i`, reconstructed from its
 /// side bits (the same bits the shift consumed as the tree order).
 fn selected_index(proof: &SoundMultiproof, i: usize) -> usize {
@@ -267,6 +324,16 @@ pub fn verify_sound_multiproof(
     ).map_err(MhotMembershipError::NodeVerify2)?;
 
     let t1 = std::time::Instant::now();
+    // -- FS Step 0: bind all public IO the global shift consumes BEFORE η=τ_p --
+    absorb_public_io(
+        challenger,
+        &proof.merkle_leaves,
+        &proof.merkle_b_bits,
+        &proof.pair_phys,
+        &proof.merkle_roots,
+        proof.n_log_merkle,
+        proof.n_routes,
+    );
     // -- ONE global merkle shift over the full P-node cube (E2) --
     let merkle_tau_pos = challenger.sample_f128_vec(MERKLE_LAYOUT.tau_pos_len());
     let merkle_fold = MerklePathFold::new(&MERKLE_LAYOUT, merkle_tau_pos);

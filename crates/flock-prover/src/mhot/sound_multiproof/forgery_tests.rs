@@ -398,6 +398,67 @@
         );
     }
 
+    // ---- E2 global batching: FS Step-0 binding of the shift's public IO ----
+    //
+    // The global sumcheck batches all P nodes via η = τ_p. Its
+    // cross-node-cancellation resistance (Schwartz-Zippel over the fixed error
+    // vector e_N, ~m/|F|) requires the shift's public inputs — the padded roots
+    // R(η), leaves L(η), side bits B(N,Y), and pair_phys — to be FIXED before η
+    // is sampled. `absorb_public_io` (FS Step 0) binds them into the transcript
+    // before the shift's τ. The full adaptive attack (a prover solving
+    // Σ_N eq(η,N)·e_N = 0 after seeing η) is not expressible as a static unit
+    // test; these confirm the binding chain: tampering any Step-0 input after
+    // proving changes the transcript / boundary and is rejected.
+
+    /// A three-node path exercises the batched node dimension (P ≥ 4 with
+    /// padding) so the tampers below hit the global shift, not a 1-node cube.
+    fn three_node_proof(domain: &'static [u8]) -> (super::SoundMultiproof, [u32; 8]) {
+        let (path, _entry) = honest_path_with_entry();
+        let mut ch = FsChallenger::new(domain);
+        let proof = prove_sound_multiproof(&[path.clone()], &mut ch);
+        let root = node_root(&path[0]);
+        (proof, root)
+    }
+
+    #[test]
+    fn global_tampered_padded_root_rejected() {
+        let (mut proof, root) = three_node_proof(b"smp-g-root");
+        proof.merkle_roots[0][0] ^= 1; // Step-0 input R(η); also the shift target
+        let mut chv = FsChallenger::new(b"smp-g-root");
+        assert!(
+            verify_sound_multiproof(&proof, &root, &mut chv).is_err(),
+            "tampered padded root must be rejected"
+        );
+    }
+
+    #[test]
+    fn global_tampered_leaf_rejected() {
+        let (mut proof, root) = three_node_proof(b"smp-g-leaf");
+        proof.merkle_leaves[0][0] ^= 1; // Step-0 input L(η)
+        let mut chv = FsChallenger::new(b"smp-g-leaf");
+        assert!(
+            verify_sound_multiproof(&proof, &root, &mut chv).is_err(),
+            "tampered leaf must be rejected"
+        );
+    }
+
+    #[test]
+    fn global_tampered_b_bit_rejected() {
+        let (mut proof, root) = three_node_proof(b"smp-g-bbit");
+        // Flip a non-depth-0 side bit (depth-0 has dedicated tests); it feeds
+        // B(N,Y) in the global sumcheck and is Step-0 bound.
+        let bb = &mut proof.merkle_b_bits[0];
+        if bb.len() < 2 {
+            bb.resize(2, false);
+        }
+        bb[1] = !bb[1];
+        let mut chv = FsChallenger::new(b"smp-g-bbit");
+        assert!(
+            verify_sound_multiproof(&proof, &root, &mut chv).is_err(),
+            "tampered side bit must be rejected"
+        );
+    }
+
     // ---- DoS wire-validity gates ----
     //
     // Latent while `SoundMultiproof` is Serialize-only, load-bearing the moment

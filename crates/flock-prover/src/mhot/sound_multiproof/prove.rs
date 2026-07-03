@@ -204,6 +204,32 @@ pub fn prove_sound_multiproof(
         "non-uniform merkle block counts break the E2 uniform-8 layout"
     );
 
+    // Tree-determined (physical) fields, once per physical node. Computed here
+    // (not at the end) so FS Step 0 can absorb them before the shift's η=τ_p.
+    let mut phys_roots: Vec<[u32; 8]> = vec![[0; 8]; n_phys];
+    let mut phys_native_roots: Vec<[u32; 8]> = vec![[0; 8]; n_phys];
+    let mut phys_block_counts: Vec<usize> = vec![0; n_phys];
+    let mut phys_metas: Vec<Option<ContentMeta>> = vec![None; n_phys];
+    for i in 0..u {
+        let p = pair_phys[i];
+        if phys_metas[p].is_none() {
+            phys_roots[p] = merkle_data[i].3;
+            phys_native_roots[p] = merkle_data[i].4;
+            phys_block_counts[p] = merkle_block_counts[i];
+            phys_metas[p] = Some(unique_nodes[i].content.clone());
+        } else {
+            debug_assert_eq!(phys_roots[p], merkle_data[i].3);
+            debug_assert_eq!(phys_native_roots[p], merkle_data[i].4);
+            debug_assert_eq!(phys_block_counts[p], merkle_block_counts[i]);
+        }
+    }
+    let phys_metas: Vec<ContentMeta> = phys_metas
+        .into_iter()
+        .map(|m| m.expect("every phys referenced"))
+        .collect();
+    let leaves_vec: Vec<[u32; 8]> = (0..u).map(|i| merkle_data[i].2).collect();
+    let b_bits_vec: Vec<Vec<bool>> = (0..u).map(|i| merkle_data[i].1.clone()).collect();
+
     // -- Pass 1: Merkle commitment --
     let merkle_alloc = allocate_blocks_uniform(u);
     let block = super::MERKLE_BLOCKS_PER_NODE;
@@ -238,6 +264,18 @@ pub fn prove_sound_multiproof(
         Some(merkle_alloc.n_real), challenger,
     );
     eprintln!("[mem] after merkle prove_fast_core: {:.0} MB", vmrss_mb());
+
+    // FS Step 0: bind all public IO the global shift consumes BEFORE η=τ_p.
+    // n_routes == u (route_witnesses.len()); mirrors the verifier's absorb.
+    super::absorb_public_io(
+        challenger,
+        &leaves_vec,
+        &b_bits_vec,
+        &pair_phys,
+        &phys_roots,
+        merkle_alloc.n_log,
+        u,
+    );
 
     let merkle_tau_pos = challenger.sample_f128_vec(MERKLE_LAYOUT.tau_pos_len());
     let merkle_fold = MerklePathFold::new(&MERKLE_LAYOUT, merkle_tau_pos);
@@ -309,28 +347,6 @@ pub fn prove_sound_multiproof(
     );
     eprintln!("[mem] after route proof: {:.0} MB", vmrss_mb());
 
-    // -- Collect the tree-determined (physical) fields once per physical
-    //    node. The padded root, native root, block count and content meta
-    //    depend only on the node's children/content, never on the selected
-    //    child; pairs sharing a physical node MUST agree on them.
-    let mut phys_roots: Vec<[u32; 8]> = vec![[0; 8]; n_phys];
-    let mut phys_native_roots: Vec<[u32; 8]> = vec![[0; 8]; n_phys];
-    let mut phys_block_counts: Vec<usize> = vec![0; n_phys];
-    let mut phys_metas: Vec<Option<ContentMeta>> = vec![None; n_phys];
-    for i in 0..u {
-        let p = pair_phys[i];
-        if phys_metas[p].is_none() {
-            phys_roots[p] = merkle_data[i].3;
-            phys_native_roots[p] = merkle_data[i].4;
-            phys_block_counts[p] = merkle_block_counts[i];
-            phys_metas[p] = Some(unique_nodes[i].content.clone());
-        } else {
-            debug_assert_eq!(phys_roots[p], merkle_data[i].3);
-            debug_assert_eq!(phys_native_roots[p], merkle_data[i].4);
-            debug_assert_eq!(phys_block_counts[p], merkle_block_counts[i]);
-        }
-    }
-
     SoundMultiproof {
         merkle_zc: merkle_open.zc_proof,
         merkle_lc: merkle_open.lc_proof,
@@ -338,11 +354,11 @@ pub fn prove_sound_multiproof(
         merkle_commitment: merkle_open.commitment,
 
         merkle_shift,
-        merkle_leaves: (0..u).map(|i| merkle_data[i].2).collect(),
+        merkle_leaves: leaves_vec,
         merkle_roots: phys_roots,
-        merkle_b_bits: (0..u).map(|i| merkle_data[i].1.clone()).collect(),
+        merkle_b_bits: b_bits_vec,
         merkle_native_roots: phys_native_roots,
-        content_metas: phys_metas.into_iter().map(|m| m.expect("every phys referenced")).collect(),
+        content_metas: phys_metas,
         pair_phys,
 
         merkle_block_counts: phys_block_counts,
