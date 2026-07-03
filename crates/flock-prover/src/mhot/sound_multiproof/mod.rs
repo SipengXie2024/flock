@@ -99,6 +99,14 @@ fn innode_depth(meta: &ContentMeta) -> usize {
 /// verifier DoS hardening, latent while `SoundMultiproof` is Serialize-only.
 const MAX_MERKLE_BLOCKS: usize = 64;
 
+/// Every honest node's in-node chain is exactly this many blocks. The shift
+/// authenticates the SELECTED LEAF's PATH to the root — `depth` compressions,
+/// where `depth = log2(next_pow2(fanout)) ≤ 5` (fanout ≤ 32). `min_n_blocks_log`
+/// floors the pad at 8, and depth ≤ 5 < 8, so the count is a uniform 8 for
+/// EVERY node regardless of fanout. E2's global sumcheck requires this uniform
+/// `node × 8 × slot` layout (`off_i = i·8`); a non-uniform count is rejected.
+pub(crate) const MERKLE_BLOCKS_PER_NODE: usize = 8;
+
 /// Absolute cap on `n_log_merkle`, checked BEFORE any `1 << n_log_merkle`
 /// (shift-overflow) or `Sha256HybridSetup::cached(1 << n_log_merkle)`
 /// (attacker-sized allocation). Honest values: 17 @N=4096, 18 @N=8192,
@@ -210,6 +218,14 @@ pub fn verify_sound_multiproof(
             return Err(MhotMembershipError::RootMismatch {
                 expected: *expected_root,
                 actual: [0; 8],
+            });
+        }
+        // Uniform-8 layout (E2 prerequisite): every honest chain is exactly 8
+        // blocks (depth ≤ 5 floored to 8). A non-uniform count would break the
+        // `off_i = i·8` node×8×slot layout the global sumcheck commits to.
+        if proof.merkle_block_counts[p] != MERKLE_BLOCKS_PER_NODE {
+            return Err(MhotMembershipError::MalformedProof {
+                reason: "non-uniform merkle block count (expected 8)",
             });
         }
     }

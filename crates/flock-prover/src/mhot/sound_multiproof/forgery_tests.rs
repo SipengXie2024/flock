@@ -486,6 +486,20 @@
         expect_malformed(&proof, &root, b"smp-dos-pairphys", "pair_phys out of range");
     }
 
+    /// Uniform-8 layout gate (E2 prerequisite): every honest chain is 8 blocks.
+    /// A tampered non-8 count must be rejected — the global sumcheck's
+    /// off_i = i·8 node×8×slot layout has no meaning otherwise.
+    #[test]
+    fn dos_gate_non_uniform_block_count_rejected() {
+        let (mut proof, root) = dos_proof(b"smp-dos-uniform8");
+        assert!(
+            proof.merkle_block_counts.iter().all(|&c| c == 8),
+            "honest counts must be uniform 8"
+        );
+        proof.merkle_block_counts[0] = 16;
+        expect_malformed(&proof, &root, b"smp-dos-uniform8", "non-uniform block count");
+    }
+
     /// n_phys > u lets junk physical nodes (never referenced by any pair) each
     /// cost the verifier a per-phys gate + a pad-forward loop, decoupled from
     /// u. Honest n_phys ≤ u; padding the per-phys vectors past u must reject.

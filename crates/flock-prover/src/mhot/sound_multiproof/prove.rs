@@ -181,6 +181,16 @@ pub fn prove_sound_multiproof(
         merkle_block_counts.push(needed);
     }
 
+    // Uniform-8 invariant (E2 layout): depth ≤ 5 (fanout ≤ 32) floored to 8 by
+    // min_n_blocks_log, so every node's chain is exactly 8 blocks. The global
+    // sumcheck's `off_i = i·8` node×8×slot layout depends on this.
+    assert!(
+        merkle_block_counts
+            .iter()
+            .all(|&c| c == super::MERKLE_BLOCKS_PER_NODE),
+        "non-uniform merkle block counts break the E2 uniform-8 layout"
+    );
+
     // -- Pass 1: Merkle commitment --
     let merkle_alloc = allocate_blocks_aligned(&merkle_block_counts);
     eprintln!("[mem] merkle alloc (n_log={}, {} blocks): {:.0} MB",
