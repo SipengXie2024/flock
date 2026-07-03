@@ -19,8 +19,14 @@
 
 use crate::field::F128;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 static POOL: Mutex<Vec<Vec<F128>>> = Mutex::new(Vec::new());
+
+/// Largest `m` the pool has been prewarmed for since the last [`clear`].
+/// Makes [`prewarm_prover`] idempotent (O(1) when already warm), so prove
+/// entry points can call it unconditionally to re-warm after a `clear`.
+static WARMED_TO_M: AtomicUsize = AtomicUsize::new(0);
 
 /// Max buffers retained. The m=29 prove cycle gives ~18 distinct buffers:
 /// witness z/a/b, the L0 codeword, zerocheck's 2 fold outputs + 2 ping-pong
@@ -101,23 +107,30 @@ pub fn give_f128(v: Vec<F128>) {
 /// work: a race between fault cost and the hiding window flips sign across
 /// machines; eliminated work doesn't.)
 ///
-/// The set (sizes in F128s): 2^(m-6)-class — L0 codeword, zerocheck round-2
-/// a/b, basefold codeword ping-pong ×2 → 5 buffers; 2^(m-7)-class — witness
-/// z/a/b, zerocheck tail ping-pong ×2, basefold a×2/b, rs_eq_ind ×2,
-/// b_combined → 11 buffers. ~1.1 GB resident at m = 29; release with
-/// [`clear`].
+/// The set is sized to the prove cycle's PEAK CONCURRENT working set, not
+/// the union of every distinct buffer — pooled take/give recycles pages
+/// across phases, so prewarming the full ~16-buffer union (5×2^(m-6) +
+/// 11×2^(m-7)) just parks never-concurrent gigabytes in RSS. Measured
+/// @N=4096 (m=32, mhot sound bench): union set = 11.6 GiB peak / 8.34 s
+/// prove; 3 large + 5 small = 6.6 GiB / 7.58 s (also faster — the smaller
+/// first-touch memset wins over the residual in-prove faults); going
+/// smaller (1L+2S) regresses both (7.1 GiB / 7.74 s) as cold allocations
+/// interleave and the pool mis-reuses. Release with [`clear`].
 pub fn prewarm_prover(m: usize) {
     use rayon::prelude::*;
     if m < 7 {
         return;
     }
+    if WARMED_TO_M.load(Ordering::Relaxed) >= m {
+        return;
+    }
     let small = 1usize << (m - 7);
     let large = 1usize << (m - 6);
     let mut bufs: Vec<Vec<F128>> = Vec::new();
-    for _ in 0..5 {
+    for _ in 0..3 {
         bufs.push(take_f128(large));
     }
-    for _ in 0..11 {
+    for _ in 0..5 {
         bufs.push(take_f128(small));
     }
     // First-touch every page of every buffer, all cores. Already-resident
@@ -131,11 +144,13 @@ pub fn prewarm_prover(m: usize) {
     for b in bufs {
         give_f128(b);
     }
+    WARMED_TO_M.fetch_max(m, Ordering::Relaxed);
 }
 
 /// Release every pooled buffer back to the OS.
 pub fn clear() {
     POOL.lock().unwrap().clear();
+    WARMED_TO_M.store(0, Ordering::Relaxed);
 }
 
 #[cfg(test)]

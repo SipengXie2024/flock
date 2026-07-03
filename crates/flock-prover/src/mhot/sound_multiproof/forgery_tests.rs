@@ -486,6 +486,36 @@
         expect_malformed(&proof, &root, b"smp-dos-npaths", "n_paths+1");
     }
 
+    /// M1 acceptance gate: proof bytes must be INDEPENDENT of scratch-pool
+    /// and setup-cache state. The pool hands out UNINITIALIZED recycled
+    /// buffers (write-before-read contract) — any read-before-write bug, or
+    /// any prewarm-set change that alters behavior, shows up here as a byte
+    /// diff between a cold-pool prove and a dirty-pool prove of the same
+    /// input. Also the regression gate for prewarm right-sizing.
+    #[test]
+    fn proof_bytes_independent_of_pool_state() {
+        let (path, _entry) = honest_path_with_entry();
+        let paths = vec![path];
+
+        flock_core::scratch::clear();
+        crate::r1cs_hashes::sha2::Sha256HybridSetup::clear_setup_cache();
+        crate::mhot::route_f32::RouteF32Setup::clear_setup_cache();
+        let mut ch1 = FsChallenger::new(b"smp-pool-ab");
+        let p1 = prove_sound_multiproof(&paths, &mut ch1);
+        let b1 = bincode::serialize(&p1).expect("serialize");
+
+        // Dirty the pool with a different prove (recycled buffers now hold
+        // that prove's stale contents), then re-prove the same input.
+        let other = two_child_input(0);
+        let mut chx = FsChallenger::new(b"smp-pool-dirty");
+        let _ = prove_sound_multiproof(&[vec![other]], &mut chx);
+
+        let mut ch2 = FsChallenger::new(b"smp-pool-ab");
+        let p2 = prove_sound_multiproof(&paths, &mut ch2);
+        let b2 = bincode::serialize(&p2).expect("serialize");
+        assert_eq!(b1, b2, "proof bytes must not depend on pool/cache state");
+    }
+
     /// Entry values are hashed by the verifier; cap their length so a single
     /// entry cannot make the verifier hash unbounded attacker data.
     #[test]

@@ -1254,14 +1254,42 @@ static SHA256_SETUP_CACHE: std::sync::OnceLock<
 
 impl Sha256HybridSetup {
     pub fn cached(n_compressions: usize) -> std::sync::Arc<Self> {
+        let setup = Self::cached_inner(n_compressions, true);
+        // Re-warm after a scratch::clear() (or after cached_verify built this
+        // entry without prewarming): O(1) via the pool watermark when warm.
+        flock_core::scratch::prewarm_prover(setup.r1cs.m);
+        setup
+    }
+
+    /// [`Self::cached`] minus the prover-pool prewarm. Verification never
+    /// touches the scratch pool, so a cold-cache verifier must not fault the
+    /// 16-buffer prove set (~21 GiB at m = 33) just to build the R1CS.
+    pub fn cached_verify(n_compressions: usize) -> std::sync::Arc<Self> {
+        Self::cached_inner(n_compressions, false)
+    }
+
+    fn cached_inner(n_compressions: usize, prewarm: bool) -> std::sync::Arc<Self> {
         let cache =
             SHA256_SETUP_CACHE.get_or_init(|| std::sync::Mutex::new(Default::default()));
         let key = min_n_blocks_log(n_compressions);
         let mut map = cache.lock().unwrap();
-        std::sync::Arc::clone(
-            map.entry(key)
-                .or_insert_with(|| std::sync::Arc::new(Self::new(n_compressions))),
-        )
+        std::sync::Arc::clone(map.entry(key).or_insert_with(|| {
+            std::sync::Arc::new(Self::with_profile_and_rate_opt(
+                n_compressions,
+                flock_core::pcs::ligerito::LigeritoProfile::Fast,
+                1,
+                prewarm,
+            ))
+        }))
+    }
+
+    /// Drop every cached setup. R1CS matrices are size-keyed and never
+    /// evicted otherwise — an N-sweep accumulates them across sizes and
+    /// contaminates peak-memory numbers.
+    pub fn clear_setup_cache() {
+        if let Some(cache) = SHA256_SETUP_CACHE.get() {
+            cache.lock().unwrap().clear();
+        }
     }
 
     pub fn new(n_compressions: usize) -> Self {
@@ -1292,14 +1320,25 @@ impl Sha256HybridSetup {
         profile: flock_core::pcs::ligerito::LigeritoProfile,
         log_inv_rate: usize,
     ) -> Self {
+        Self::with_profile_and_rate_opt(n_compressions, profile, log_inv_rate, true)
+    }
+
+    fn with_profile_and_rate_opt(
+        n_compressions: usize,
+        profile: flock_core::pcs::ligerito::LigeritoProfile,
+        log_inv_rate: usize,
+        prewarm: bool,
+    ) -> Self {
         assert!(n_compressions >= 1, "n_compressions must be ≥ 1");
         let n_log = min_n_blocks_log(n_compressions);
         let r1cs = build_block_r1cs(n_log);
         // Warm the CSC fold circuit so its one-time build stays out of the
-        // first prove/verify, and pre-fault the prove-cycle scratch buffers
-        // so even the first prove performs no page faults.
+        // first prove/verify, and (on prove paths) pre-fault the prove-cycle
+        // scratch buffers so even the first prove performs no page faults.
         r1cs.csc_lincheck_circuit();
-        flock_core::scratch::prewarm_prover(r1cs.m);
+        if prewarm {
+            flock_core::scratch::prewarm_prover(r1cs.m);
+        }
         let pcs_params = flock_core::pcs::PcsParams {
             m: r1cs.m,
             log_inv_rate,

@@ -367,22 +367,52 @@ static SETUP_CACHE: std::sync::OnceLock<
 
 impl RouteF32Setup {
     pub fn cached(n_instances: usize) -> std::sync::Arc<Self> {
+        let setup = Self::cached_inner(n_instances, true);
+        // Re-warm after a scratch::clear() (or after cached_verify built this
+        // entry without prewarming): O(1) via the pool watermark when warm.
+        flock_core::scratch::prewarm_prover(setup.r1cs.m);
+        setup
+    }
+
+    /// [`Self::cached`] minus the prover-pool prewarm. Verification never
+    /// touches the scratch pool, so a cold-cache verifier must not fault the
+    /// prove buffer set just to build the route R1CS.
+    pub fn cached_verify(n_instances: usize) -> std::sync::Arc<Self> {
+        Self::cached_inner(n_instances, false)
+    }
+
+    fn cached_inner(n_instances: usize, prewarm: bool) -> std::sync::Arc<Self> {
         let cache = SETUP_CACHE.get_or_init(|| std::sync::Mutex::new(Default::default()));
         let setup_n = route_setup_n_instances(n_instances);
         let mut map = cache.lock().unwrap();
         std::sync::Arc::clone(
             map.entry(setup_n)
-                .or_insert_with(|| std::sync::Arc::new(Self::new(n_instances))),
+                .or_insert_with(|| std::sync::Arc::new(Self::new_opt(n_instances, prewarm))),
         )
     }
 
+    /// Drop every cached setup. R1CS matrices are size-keyed and never
+    /// evicted otherwise — an N-sweep accumulates them across sizes and
+    /// contaminates peak-memory numbers.
+    pub fn clear_setup_cache() {
+        if let Some(cache) = SETUP_CACHE.get() {
+            cache.lock().unwrap().clear();
+        }
+    }
+
     pub fn new(n_instances: usize) -> Self {
+        Self::new_opt(n_instances, true)
+    }
+
+    fn new_opt(n_instances: usize, prewarm: bool) -> Self {
         assert!(n_instances >= 1, "n_instances must be >= 1");
         let setup_n_instances = route_setup_n_instances(n_instances);
         let n_blocks_log = setup_n_instances.trailing_zeros() as usize;
         let r1cs = build_block_r1cs_f32(n_blocks_log);
         r1cs.csc_lincheck_circuit();
-        flock_core::scratch::prewarm_prover(r1cs.m);
+        if prewarm {
+            flock_core::scratch::prewarm_prover(r1cs.m);
+        }
         let pcs_params = PcsParams {
             m: r1cs.m,
             log_inv_rate: 1,

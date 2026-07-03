@@ -235,7 +235,7 @@ pub fn verify_sound_multiproof(
 
     // -- Verify merkle core --
     let merkle_n_total = 1usize << proof.n_log_merkle;
-    let merkle_setup = Sha256HybridSetup::cached(merkle_n_total);
+    let merkle_setup = Sha256HybridSetup::cached_verify(merkle_n_total);
     let (merkle_ab, merkle_c) = flock_core::verifier::verify_core(
         &merkle_setup.r1cs,
         &proof.merkle_zc, &proof.merkle_lc, &proof.merkle_commitment,
@@ -366,7 +366,7 @@ pub fn verify_sound_multiproof(
     }
 
     // -- Route verify core --
-    let route_setup = RouteF32Setup::cached(proof.n_routes);
+    let route_setup = RouteF32Setup::cached_verify(proof.n_routes);
     let (route_ab, route_c) = flock_core::verifier::verify_core(
         &route_setup.r1cs,
         &proof.route_zc, &proof.route_lc, &proof.route_commitment,

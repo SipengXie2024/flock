@@ -74,7 +74,14 @@ fn sound_vs_native_benchmark() {
         "N", "nmulti_KB", "flock_KB", "ratio", "nv_mul_ms", "fp_ms", "fv_ms", "unique");
     eprintln!("{}", "-".repeat(80));
 
-    for &n in &[1, 16, 256, 4096] {
+    // BENCH_NS=8192 (comma-separated) runs a chosen subset — peak-memory
+    // acceptance numbers must come from a standalone single-N process, not
+    // mid-sweep.
+    let ns: Vec<usize> = std::env::var("BENCH_NS")
+        .ok()
+        .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+        .unwrap_or_else(|| vec![256, 1024, 4096, 8192]);
+    for &n in &ns {
         let filename = format!("/tmp/mhot_export_n{}.json", n);
         let json = match std::fs::read_to_string(&filename) {
             Ok(j) => j,
@@ -89,8 +96,11 @@ fn sound_vs_native_benchmark() {
             .map(|p| p.nodes.iter().map(node_data_to_input).collect())
             .collect();
 
-        // Per-N peaks must not include the previous N's retained scratch pool.
+        // Per-N peaks must not include the previous N's retained scratch pool
+        // or its size-keyed R1CS setups (the setup caches never evict).
         flock_core::scratch::clear();
+        flock_prover::r1cs_hashes::sha2::Sha256HybridSetup::clear_setup_cache();
+        flock_prover::mhot::route_f32::RouteF32Setup::clear_setup_cache();
 
         let mut ch = FsChallenger::new(b"sound-vs-native");
         let t0 = Instant::now();
