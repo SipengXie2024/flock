@@ -397,3 +397,106 @@
             "tampered native_root must fail the pad-forward check, got {res:?}"
         );
     }
+
+    // ---- DoS wire-validity gates ----
+    //
+    // Latent while `SoundMultiproof` is Serialize-only, load-bearing the moment
+    // it gains a Deserialize path. Each gate must reject with MalformedProof
+    // BEFORE any cached()/allocation-driving use of the tampered value; tests
+    // use honest+1-style malformations so a mis-ordered gate fails the test
+    // quickly (wrong error variant) instead of OOMing the test runner.
+
+    fn dos_proof(domain: &'static [u8]) -> (super::SoundMultiproof, [u32; 8]) {
+        let input = two_child_input(1);
+        let root = node_root(&input);
+        let mut ch = FsChallenger::new(domain);
+        let proof = prove_sound_multiproof(&[vec![input]], &mut ch);
+        (proof, root)
+    }
+
+    fn expect_malformed(
+        proof: &super::SoundMultiproof,
+        root: &[u32; 8],
+        domain: &'static [u8],
+        what: &str,
+    ) {
+        let mut chv = FsChallenger::new(domain);
+        let res = verify_sound_multiproof(proof, root, &mut chv);
+        assert!(
+            matches!(res, Err(MhotMembershipError::MalformedProof { .. })),
+            "{what} must be rejected by a wire-validity gate, got {res:?}"
+        );
+    }
+
+    /// n_log_merkle ≥ word size would make `1usize << n_log_merkle` shift-
+    /// overflow (panic in debug, wrap in release) before any semantic check.
+    /// The absolute cap must reject it first.
+    #[test]
+    fn dos_gate_n_log_overflow_rejected() {
+        let (mut proof, root) = dos_proof(b"smp-dos-nlog-ovf");
+        proof.n_log_merkle = 64;
+        expect_malformed(&proof, &root, b"smp-dos-nlog-ovf", "n_log_merkle=64");
+    }
+
+    /// Inflated n_log_merkle drives `Sha256HybridSetup::cached(1 << n_log)` — an
+    /// attacker-sized allocation. The canonical-recompute gate pins n_log to the
+    /// exact value `allocate_blocks_aligned` derives from offsets+counts.
+    #[test]
+    fn dos_gate_n_log_inflated_rejected() {
+        let (mut proof, root) = dos_proof(b"smp-dos-nlog-inf");
+        proof.n_log_merkle += 1;
+        expect_malformed(&proof, &root, b"smp-dos-nlog-inf", "n_log_merkle+1");
+    }
+
+    /// n_routes drives `RouteF32Setup::cached(n_routes)` (R1CS build sized by
+    /// it). Honest value is exactly the unique-node count.
+    #[test]
+    fn dos_gate_n_routes_inflated_rejected() {
+        let (mut proof, root) = dos_proof(b"smp-dos-nroutes");
+        proof.n_routes += 1;
+        expect_malformed(&proof, &root, b"smp-dos-nroutes", "n_routes+1");
+    }
+
+    /// Block offsets are prover-chosen wire numbers; the claim-point assembly
+    /// consumes them raw. They must be aligned to their (power-of-two) count —
+    /// the invariant `allocate_blocks_aligned` guarantees for honest proofs.
+    #[test]
+    fn dos_gate_offset_misaligned_rejected() {
+        let (mut proof, root) = dos_proof(b"smp-dos-off-align");
+        proof.merkle_block_offsets[0] += 1;
+        expect_malformed(&proof, &root, b"smp-dos-off-align", "misaligned offset");
+    }
+
+    /// An offset past the committed range would place the PD claim outside the
+    /// commitment (and lets offset+count overflow-wrap on adversarial values).
+    #[test]
+    fn dos_gate_offset_out_of_range_rejected() {
+        let (mut proof, root) = dos_proof(b"smp-dos-off-range");
+        // Aligned (2^n_log is a multiple of the count) but end > 1 << n_log.
+        proof.merkle_block_offsets[0] = 1usize << proof.n_log_merkle;
+        expect_malformed(&proof, &root, b"smp-dos-off-range", "out-of-range offset");
+    }
+
+    /// n_paths is wire-carried but was never read by verify (write-only field);
+    /// until the E1 wire bump deletes it, it must at least be consistent.
+    #[test]
+    fn dos_gate_n_paths_mismatch_rejected() {
+        let (mut proof, root) = dos_proof(b"smp-dos-npaths");
+        proof.n_paths += 1;
+        expect_malformed(&proof, &root, b"smp-dos-npaths", "n_paths+1");
+    }
+
+    /// Entry values are hashed by the verifier; cap their length so a single
+    /// entry cannot make the verifier hash unbounded attacker data.
+    #[test]
+    fn dos_gate_entry_value_oversized_rejected() {
+        let (path, mut entry) = honest_path_with_entry();
+        let (proof, root) = prove_and_root(&[path]);
+        entry.value = vec![0u8; (1 << 20) + 1];
+        let mut chv = FsChallenger::new(b"smp-entries");
+        let res = verify_sound_multiproof_with_entries(&proof, &root, &[entry], &mut chv);
+        assert!(
+            matches!(res, Err(MhotMembershipError::MalformedProof { .. })),
+            "oversized entry value must be rejected by the length gate, got {res:?}"
+        );
+    }

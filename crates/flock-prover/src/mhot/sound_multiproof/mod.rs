@@ -92,6 +92,20 @@ fn innode_depth(meta: &ContentMeta) -> usize {
 /// verifier DoS hardening, latent while `SoundMultiproof` is Serialize-only.
 const MAX_MERKLE_BLOCKS: usize = 64;
 
+/// Absolute cap on `n_log_merkle`, checked BEFORE any `1 << n_log_merkle`
+/// (shift-overflow) or `Sha256HybridSetup::cached(1 << n_log_merkle)`
+/// (attacker-sized allocation). Honest values: 17 @N=4096, 18 @N=8192,
+/// 19 @N=16384 — 20 leaves one doubling of headroom. Defense sits in three
+/// layers: this cap, the canonical-recompute gate below (pins n_log to the
+/// offsets+counts-derived value), and the verify path not prewarming the
+/// prover pool.
+const MAX_N_LOG_MERKLE: usize = 20;
+
+/// Cap on a public entry's value length: the verifier hashes each value once
+/// (leaf_content_hash), so unbounded values make verify cost attacker-chosen.
+/// Native MHOT values are ≤ a few hundred bytes; 1 MiB is generous headroom.
+const MAX_ENTRY_VALUE_LEN: usize = 1 << 20;
+
 /// The true in-node side bit at depth `d` for node `i` (LSB-at-depth-0). Every
 /// depth including 0 carries the REAL side in the public `b_bits` (native-order
 /// chains; the forced-b0 convention is gone). Single source of truth for the
@@ -142,6 +156,25 @@ pub fn verify_sound_multiproof(
             actual: [0; 8],
         });
     }
+    // -- Wire-validity gates: every gate here runs BEFORE the value it checks
+    //    reaches a cached()/setup/pool allocation or a shift expression, so a
+    //    malformed proof is rejected at wire-comparison cost. The n_log cap
+    //    must precede any `1 << n_log_merkle`.
+    if proof.n_log_merkle > MAX_N_LOG_MERKLE {
+        return Err(MhotMembershipError::MalformedProof {
+            reason: "n_log_merkle over absolute cap",
+        });
+    }
+    if proof.n_routes != u {
+        return Err(MhotMembershipError::MalformedProof {
+            reason: "n_routes != unique node count",
+        });
+    }
+    if proof.n_paths != proof.path_mapping.node_indices.len() {
+        return Err(MhotMembershipError::MalformedProof {
+            reason: "n_paths != path_mapping length",
+        });
+    }
     for i in 0..u {
         let meta = &proof.content_metas[i];
         let mask_bits: u32 = meta.extraction_masks.iter().map(|m| m.count_ones()).sum();
@@ -161,6 +194,38 @@ pub fn verify_sound_multiproof(
             return Err(MhotMembershipError::RootMismatch {
                 expected: *expected_root,
                 actual: [0; 8],
+            });
+        }
+        // Offsets are prover-chosen; unaligned or out-of-range values would
+        // alias the PD claim point inside the 2^n_log space (bit decomposition
+        // wraps) or overflow offset+count. Honest offsets come from
+        // allocate_blocks_aligned: aligned to their own (power-of-two) count
+        // and contained in the committed range.
+        let off = proof.merkle_block_offsets[i];
+        let cnt = proof.merkle_block_counts[i];
+        if off % cnt != 0
+            || off
+                .checked_add(cnt)
+                .map_or(true, |end| end > 1usize << proof.n_log_merkle)
+        {
+            return Err(MhotMembershipError::MalformedProof {
+                reason: "block offset misaligned or out of committed range",
+            });
+        }
+    }
+    // Canonical-recompute gate: n_log_merkle must be EXACTLY what
+    // allocate_blocks_aligned derives from the (now-validated) offsets and
+    // counts — max end, floored at 1 << (22 - K_LOG), rounded to a power of
+    // two. This pins the setup allocation size to the wire's real span.
+    {
+        let max_end = (0..u)
+            .map(|i| proof.merkle_block_offsets[i] + proof.merkle_block_counts[i])
+            .max()
+            .expect("u > 0 gated above");
+        let min_n = 1usize << (22 - crate::r1cs_hashes::sha2::K_LOG);
+        if 1usize << proof.n_log_merkle != max_end.max(min_n).next_power_of_two() {
+            return Err(MhotMembershipError::MalformedProof {
+                reason: "n_log_merkle != canonical allocation size",
             });
         }
     }
@@ -362,12 +427,17 @@ pub fn verify_sound_multiproof_with_entries(
     entries: &[PathEntry],
     challenger: &mut FsChallenger,
 ) -> Result<(), MhotMembershipError> {
-    // Cheap precondition before the ~O(U) structural verify.
+    // Cheap preconditions before the ~O(U) structural verify.
     let n_paths = proof.path_mapping.node_indices.len();
     if entries.len() != n_paths {
         return Err(MhotMembershipError::EntryCountMismatch {
             n_entries: entries.len(),
             n_paths,
+        });
+    }
+    if entries.iter().any(|e| e.value.len() > MAX_ENTRY_VALUE_LEN) {
+        return Err(MhotMembershipError::MalformedProof {
+            reason: "entry value over length cap",
         });
     }
 

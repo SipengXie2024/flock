@@ -50,6 +50,10 @@ pub enum MhotMembershipError {
     /// The path's terminal authenticated leaf is not the hash of the public
     /// (key, value) entry.
     EntryLeafMismatch { path_idx: usize },
+    /// A wire field failed a cheap validity gate BEFORE any allocation-driving
+    /// use (verifier DoS hardening): rejection costs wire-value comparisons,
+    /// never a setup/pool allocation sized by attacker-controlled numbers.
+    MalformedProof { reason: &'static str },
 }
 
 /// Proof for a single MHOT node's in-node binary Merkle path.
