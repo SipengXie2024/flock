@@ -295,6 +295,16 @@ pub fn verify_sound_multiproof(
                 reason: "pair_phys index out of range",
             });
         }
+        // Every honest chain is padded to exactly 8 side bits. Bound the length
+        // BEFORE FS Step-0 (absorb_public_io) iterates every bit — otherwise a
+        // single oversized b_bits vector (the shift itself truncates at 8, so
+        // it is the ONLY unbounded consumer) hangs/OOMs the verifier. Latent
+        // while Serialize-only; a per-pair DoS gate all the same.
+        if proof.merkle_b_bits[i].len() != MERKLE_BLOCKS_PER_NODE {
+            return Err(MhotMembershipError::MalformedProof {
+                reason: "b_bits length != 8",
+            });
+        }
     }
     // Canonical-recompute gate (uniform-8): offsets are DERIVED (`off_i = i·8`),
     // not carried, so n_log_merkle must be EXACTLY `next_pow2(max(8u, min_n))`.

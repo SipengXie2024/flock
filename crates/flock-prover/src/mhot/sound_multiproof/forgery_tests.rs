@@ -532,6 +532,17 @@
         expect_malformed(&proof, &root, b"smp-dos-pairphys", "pair_phys out of range");
     }
 
+    /// FS Step-0 absorb iterates every side bit; an oversized b_bits vector
+    /// (honest len == 8) would hang the verifier before the shift (which
+    /// truncates at 8). The per-pair length gate must reject it.
+    #[test]
+    fn dos_gate_oversized_b_bits_rejected() {
+        let (mut proof, root) = dos_proof(b"smp-dos-bbits");
+        assert_eq!(proof.merkle_b_bits[0].len(), 8, "honest b_bits len is 8");
+        proof.merkle_b_bits[0].resize(1 << 20, false);
+        expect_malformed(&proof, &root, b"smp-dos-bbits", "oversized b_bits");
+    }
+
     /// Uniform-8 layout gate (E2 prerequisite): every honest chain is 8 blocks.
     /// A tampered non-8 count must be rejected — the global sumcheck's
     /// off_i = i·8 node×8×slot layout has no meaning otherwise.
