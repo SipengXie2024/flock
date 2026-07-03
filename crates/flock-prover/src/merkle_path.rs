@@ -455,15 +455,19 @@ pub fn prove_merkle_path_shift<Ch: Challenger>(
 // ---------------------------------------------------------------------------
 
 /// Verify the merkle-path shift proof. `leaf_evals[i_p]` is the public scalar
-/// `leaf_{i_p}(r)` (the r-fold of path `i_p`'s leaf bit-vector); `root_r` is
-/// the single shared `root(r)` scalar. For `path_log=0`, `leaf_evals` must be
-/// length 1 (the single-path leaf).
+/// `leaf_{i_p}(r)` (the r-fold of path `i_p`'s leaf bit-vector); `root_evals[i_p]`
+/// is path `i_p`'s `root(r)` scalar. Both have length `2^path_log`.
+///
+/// Per-path roots (`root_evals`) — not one shared scalar — are what let the
+/// `path_log = m` node dimension carry a DIFFERENT root per node (E2 global
+/// batching, η = τ_p). For a single shared root, pass `2^path_log` copies; for
+/// `path_log = 0` pass `&[root_r]`.
 #[allow(clippy::too_many_arguments)]
 pub fn verify_merkle_path_shift<Ch: Challenger>(
     path_log: usize,
     proof: &MerklePathShiftProof,
     leaf_evals: &[F128],
-    root_r: F128,
+    root_evals: &[F128],
     b_bits: &[bool],
     n: usize,
     layout: SlotLayout,
@@ -483,6 +487,11 @@ pub fn verify_merkle_path_shift<Ch: Challenger>(
         n_paths,
         "leaf_evals must have length 2^path_log"
     );
+    assert_eq!(
+        root_evals.len(),
+        n_paths,
+        "root_evals must have length 2^path_log"
+    );
 
     // Resample τ, α (mirror prover).
     let tau = challenger.sample_f128_vec(n);
@@ -491,18 +500,22 @@ pub fn verify_merkle_path_shift<Ch: Challenger>(
     let tau_p = &tau[pos_log..n];
 
     // Initial public claim
-    //   C = eq(τ_q, 1^{pos_log}) · root(r)
-    //     + α · Σ_{i_p} eq(τ_p, i_p) · leaf_{i_p}(r)
-    // (The root term has no τ_p dependence because the per-path boundary
-    //  contributions sum out via Σ_{i_p} eq(τ_p, i_p) = 1.)
+    //   C = eq(τ_q, 1^{pos_log}) · R(τ_p)  +  α · L(τ_p)
+    //   R(τ_p) = Σ_{i_p} eq(τ_p, i_p) · root_{i_p}(r)   [per-path root fold]
+    //   L(τ_p) = Σ_{i_p} eq(τ_p, i_p) · leaf_{i_p}(r)
+    // For a single shared root, R(τ_p) = root_r · Σ eq(τ_p,i_p) = root_r.
     let eq_tau_q_ones = tau_q.iter().copied().fold(F128::ONE, |acc, t| acc * t);
     let eq_tau_p_table = build_eq_table(tau_p);
-    let combined_leaf: F128 = eq_tau_p_table
-        .iter()
-        .zip(leaf_evals.iter())
-        .map(|(&w, &v)| w * v)
-        .fold(F128::ZERO, |a, b| a + b);
-    let mut claim = eq_tau_q_ones * root_r + alpha * combined_leaf;
+    let fold_pt = |vals: &[F128]| -> F128 {
+        eq_tau_p_table
+            .iter()
+            .zip(vals.iter())
+            .map(|(&w, &v)| w * v)
+            .fold(F128::ZERO, |a, b| a + b)
+    };
+    let combined_root = fold_pt(root_evals);
+    let combined_leaf = fold_pt(leaf_evals);
+    let mut claim = eq_tau_q_ones * combined_root + alpha * combined_leaf;
 
     // Replay sumcheck rounds.
     let mut r_pts: Vec<F128> = Vec::with_capacity(d);
@@ -702,6 +715,134 @@ mod tests {
         }
     }
 
+    /// E2 global batching: `P = 2^path_log` independent nodes, each an honest
+    /// `L = 2^pos_log`-block chain, concatenated into the flat `N‖Y` cube
+    /// (node `p` occupies rows `[p·L, p·L+L)`, `Y` low). Every node has its own
+    /// leaf (row 0, placed per its real depth-0 side bit) and root (row L-1).
+    /// The chain never crosses a node boundary — row `p·L` is the leaf, not the
+    /// previous node's output (the shift's `α·δ(Y=0)` leaf term + `shift(0)=0`).
+    #[allow(clippy::type_complexity)]
+    fn build_honest_multinode(
+        path_log: usize,
+        pos_log: usize,
+        seed: u64,
+    ) -> (
+        Vec<F128>, // x_l
+        Vec<F128>, // x_r
+        Vec<F128>, // z
+        Vec<F128>, // iv
+        Vec<bool>, // b (N-major, length P·L)
+        Vec<F128>, // leaves[P]
+        Vec<F128>, // roots[P]
+    ) {
+        let mut rng = Rng::new(seed);
+        let p = 1usize << path_log;
+        let l = 1usize << pos_log;
+        let n_total = p * l;
+        let mut x_l = vec![F128::ZERO; n_total];
+        let mut x_r = vec![F128::ZERO; n_total];
+        let mut z = vec![F128::ZERO; n_total];
+        let mut b = vec![false; n_total];
+        let mut leaves = vec![F128::ZERO; p];
+        let mut roots = vec![F128::ZERO; p];
+        for node in 0..p {
+            let base = node * l;
+            for i in 0..l {
+                z[base + i] = rng.f128();
+            }
+            let b0 = rng.bit();
+            b[base] = b0;
+            for i in 1..l {
+                b[base + i] = rng.bit();
+            }
+            let leaf = rng.f128();
+            let sibling0 = rng.f128();
+            // Sel(0) = leaf, placed in the slot the real depth-0 side bit selects.
+            if b0 {
+                x_r[base] = leaf;
+                x_l[base] = sibling0;
+            } else {
+                x_l[base] = leaf;
+                x_r[base] = sibling0;
+            }
+            for i in 1..l {
+                if !b[base + i] {
+                    x_l[base + i] = z[base + i - 1];
+                    x_r[base + i] = rng.f128();
+                } else {
+                    x_r[base + i] = z[base + i - 1];
+                    x_l[base + i] = rng.f128();
+                }
+            }
+            leaves[node] = leaf;
+            roots[node] = z[base + l - 1];
+        }
+        let iv: Vec<F128> = (0..n_total).map(|_| rng.f128()).collect();
+        (x_l, x_r, z, iv, b, leaves, roots)
+    }
+
+    /// E2 core: `prove_merkle_path_shift(path_log = m)` + per-node-root verify
+    /// must round-trip on a P-node cube with DIFFERENT roots per node. This is
+    /// the reuse claim — the existing shift engine batches nodes via τ_p (= η),
+    /// the only generalization being the per-path root fold.
+    #[test]
+    fn global_multinode_roundtrip_accepts() {
+        for &m in &[1usize, 2, 3] {
+            let pos_log = 3; // uniform-8 layout
+            let n = m + pos_log;
+            let (x_l, x_r, z, iv, b, leaves, roots) =
+                build_honest_multinode(m, pos_log, 0xE2 + m as u64);
+            // Sanity: roots really differ per node (not a shared-root shortcut).
+            assert!(roots.windows(2).any(|w| w[0] != w[1]) || (1 << m) == 1);
+            let layout = canonical_layout();
+            let mut ch_p = FsChallenger::new(b"e2-global-v0");
+            let (proof, claims_p) =
+                prove_merkle_path_shift(m, &x_l, &x_r, &z, &iv, &b, layout, &mut ch_p);
+            assert_eq!(proof.rounds.len(), n + 2, "m={m}: rounds must be n+2");
+            let mut ch_v = FsChallenger::new(b"e2-global-v0");
+            let claims_v =
+                verify_merkle_path_shift(m, &proof, &leaves, &roots, &b, n, layout, &mut ch_v)
+                    .unwrap_or_else(|e| panic!("global verify rejected honest m={m}: {e:?}"));
+            assert_eq!(claims_v, claims_p, "claims must match m={m}");
+        }
+    }
+
+    #[test]
+    fn global_multinode_wrong_root_rejected() {
+        let (m, pos_log) = (2usize, 3usize);
+        let n = m + pos_log;
+        let (x_l, x_r, z, iv, b, leaves, mut roots) = build_honest_multinode(m, pos_log, 0xBAD1);
+        let layout = canonical_layout();
+        let mut ch_p = FsChallenger::new(b"e2-global-v0");
+        let (proof, _) = prove_merkle_path_shift(m, &x_l, &x_r, &z, &iv, &b, layout, &mut ch_p);
+        roots[1] = roots[1] + F128::ONE; // tamper ONE node's public root
+        let mut ch_v = FsChallenger::new(b"e2-global-v0");
+        let res = verify_merkle_path_shift(m, &proof, &leaves, &roots, &b, n, layout, &mut ch_v);
+        assert_eq!(
+            res,
+            Err(MerklePathError::SumcheckFinal),
+            "a wrong per-node root must be rejected"
+        );
+    }
+
+    #[test]
+    fn global_multinode_wrong_leaf_rejected() {
+        let (m, pos_log) = (2usize, 3usize);
+        let n = m + pos_log;
+        let (x_l, x_r, z, iv, b, mut leaves, roots) = build_honest_multinode(m, pos_log, 0xBAD2);
+        let layout = canonical_layout();
+        let mut ch_p = FsChallenger::new(b"e2-global-v0");
+        let (proof, _) = prove_merkle_path_shift(m, &x_l, &x_r, &z, &iv, &b, layout, &mut ch_p);
+        leaves[2] = leaves[2] + F128::ONE; // tamper ONE node's public leaf
+        let mut ch_v = FsChallenger::new(b"e2-global-v0");
+        let res = verify_merkle_path_shift(m, &proof, &leaves, &roots, &b, n, layout, &mut ch_v);
+        assert_eq!(
+            res,
+            Err(MerklePathError::SumcheckFinal),
+            "a wrong per-node leaf must be rejected"
+        );
+    }
+
     /// Route-2: with the forced-B(0)=0 convention removed, the shift must
     /// authenticate a tree whose depth-0 leaf is a RIGHT child (b_bits[0]=true).
     #[test]
@@ -716,7 +857,7 @@ mod tests {
                     prove_merkle_path_shift(0, &x_l, &x_r, &z, &iv, &b, layout, &mut ch_p);
                 let mut ch_v = FsChallenger::new(b"merkle-test-v0");
                 let claims_v =
-                    verify_merkle_path_shift(0, &proof, &[leaf], root, &b, n, layout, &mut ch_v)
+                    verify_merkle_path_shift(0, &proof, &[leaf], &[root], &b, n, layout, &mut ch_v)
                         .unwrap_or_else(|e| panic!("verify rejected honest b0={b0} proof: {e:?}"));
                 assert_eq!(claims_v, claims_p, "claims must match at n={n} b0={b0}");
             }
@@ -770,7 +911,7 @@ mod tests {
 
             let mut ch_v = FsChallenger::new(b"merkle-test-v0");
             let claims_v =
-                verify_merkle_path_shift(0, &proof, &[leaf], root, &b, n, layout, &mut ch_v)
+                verify_merkle_path_shift(0, &proof, &[leaf], &[root], &b, n, layout, &mut ch_v)
                     .unwrap_or_else(|e| panic!("verify rejected honest proof at n={n}: {e:?}"));
 
             assert_eq!(claims_v, claims_p, "claims must match at n={n}");
@@ -792,7 +933,7 @@ mod tests {
         let mut ch_p = FsChallenger::new(b"merkle-test-v0");
         let (proof, _) = prove_merkle_path_shift(0, &x_l, &x_r, &z, &iv, &b, layout, &mut ch_p);
         let mut ch_v = FsChallenger::new(b"merkle-test-v0");
-        let res = verify_merkle_path_shift(0, &proof, &[leaf], root, &b, n, layout, &mut ch_v);
+        let res = verify_merkle_path_shift(0, &proof, &[leaf], &[root], &b, n, layout, &mut ch_v);
         assert!(matches!(res, Err(MerklePathError::SumcheckFinal)));
     }
 
@@ -807,7 +948,7 @@ mod tests {
         let mut bad_leaf = leaf;
         bad_leaf.lo ^= 1;
         let mut ch_v = FsChallenger::new(b"merkle-test-v0");
-        let res = verify_merkle_path_shift(0, &proof, &[bad_leaf], root, &b, n, layout, &mut ch_v);
+        let res = verify_merkle_path_shift(0, &proof, &[bad_leaf], &[root], &b, n, layout, &mut ch_v);
         assert!(matches!(res, Err(MerklePathError::SumcheckFinal)));
     }
 
@@ -821,7 +962,7 @@ mod tests {
         let mut bad_root = root;
         bad_root.lo ^= 1;
         let mut ch_v = FsChallenger::new(b"merkle-test-v0");
-        let res = verify_merkle_path_shift(0, &proof, &[leaf], bad_root, &b, n, layout, &mut ch_v);
+        let res = verify_merkle_path_shift(0, &proof, &[leaf], &[bad_root], &b, n, layout, &mut ch_v);
         assert!(matches!(res, Err(MerklePathError::SumcheckFinal)));
     }
 }

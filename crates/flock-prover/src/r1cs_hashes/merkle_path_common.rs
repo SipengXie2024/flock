@@ -621,7 +621,7 @@ pub fn verify_merkle_path_generic<Ch: Challenger>(
         0, // path_log: single-path
         &proof.shift,
         &[leaf_r],
-        root_r,
+        &[root_r],
         b_bits,
         n_log,
         layout.slot_layout(),
@@ -864,12 +864,15 @@ pub fn verify_merkle_paths_generic<Ch: Challenger>(
         .map(|lp| fold.fold_public_phys(lp))
         .collect();
     let root_r = fold.fold_public_phys(root_phys);
+    // This path shares ONE root across all leaves — broadcast it so the
+    // per-path fold R(τ_p) = root_r · Σ eq(τ_p,i_p) = root_r.
+    let root_evals = vec![root_r; leaf_evals.len()];
 
     let claims = crate::merkle_path::verify_merkle_path_shift(
         path_log,
         &proof.shift,
         &leaf_evals,
-        root_r,
+        &root_evals,
         b_bits,
         n_log,
         layout.slot_layout(),

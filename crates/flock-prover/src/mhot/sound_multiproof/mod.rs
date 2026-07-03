@@ -303,7 +303,7 @@ pub fn verify_sound_multiproof(
         b_bits_padded.resize(n_inst, false);
 
         let claims = verify_merkle_path_shift(
-            0, &proof.merkle_shifts[i], &[leaf_r], root_r,
+            0, &proof.merkle_shifts[i], &[leaf_r], &[root_r],
             &b_bits_padded, inst_log, MERKLE_LAYOUT.slot_layout(), challenger,
         ).map_err(|e| MhotMembershipError::NodeVerify2(
             flock_core::verifier::VerifyError::Wiring(format!("merkle shift {i}: {e:?}"))
