@@ -523,18 +523,23 @@ pub fn verify_sound_multiproof(
 /// proven statement equal to native's: "each (key, value) in `entries` is a
 /// member under `expected_root`".
 ///
-/// FIAT-SHAMIR NOTE: `entries` are bound purely by these verifier-side native
-/// checks and are intentionally NOT absorbed into the transcript — sound today
-/// because every input to the checks (content_metas, b_bits, merkle_leaves,
-/// merkle_native_roots via the pad-forward binding to the shift-authenticated
-/// merkle_roots) is transitively authenticated against `expected_root` through
-/// deterministic equalities that consume no sampled challenge. The same applies
-/// to the shift's public IO (b_bits/leaves/roots/block_counts): they are pinned
-/// by those downstream native checks, not by transcript absorption. If any of
-/// these checks ever moves in-protocol (RLC-batched public claims), `entries`,
-/// `path_mapping` AND the shift public IO MUST be absorbed BEFORE any batching
-/// coefficient is sampled, or a Jolt-style unfaithful-claims under-binding
-/// reopens forgeries.
+/// FIAT-SHAMIR NOTE (updated for E2 global batching): the shift moved
+/// in-protocol — the global sumcheck batches all P nodes via a challenge
+/// (η = τ_p) that folds the per-node padded roots R(η) and leaves L(η). So the
+/// shift's public IO that defines the batched error vector — padded `roots`,
+/// `leaves`, `b_bits`, `pair_phys`, `n_log_merkle`, `n_routes` — IS now absorbed
+/// into the transcript BEFORE η, by [`absorb_public_io`] (FS Step 0), on both
+/// sides byte-identically. Without it a char-2 prover could pick those after
+/// seeing η to cancel a forged node (`Σ_N eq(η,N)·e_N = 0`).
+///
+/// Everything else stays bound by DETERMINISTIC verifier equalities that consume
+/// no challenge, so it needs no absorption: `entries` (routing on authenticated
+/// content_metas + terminal leaf hash), `merkle_native_roots` (pad-forward to
+/// the shift-authenticated padded root), `content_metas` / `path_mapping`
+/// (cross-node + root checks). Each is transitively authenticated against
+/// `expected_root`. If ANY of those checks later moves in-protocol (RLC-batched
+/// public claims), its inputs MUST likewise be absorbed before the batching
+/// coefficient, or unfaithful-claims under-binding reopens forgeries.
 pub fn verify_sound_multiproof_with_entries(
     proof: &SoundMultiproof,
     expected_root: &[u32; 8],
