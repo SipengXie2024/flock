@@ -477,13 +477,55 @@
         expect_malformed(&proof, &root, b"smp-dos-off-range", "out-of-range offset");
     }
 
-    /// n_paths is wire-carried but was never read by verify (write-only field);
-    /// until the E1 wire bump deletes it, it must at least be consistent.
+    /// Every pair must reference a valid physical-node entry; an out-of-range
+    /// pair_phys index must be gated before any indexed use.
     #[test]
-    fn dos_gate_n_paths_mismatch_rejected() {
-        let (mut proof, root) = dos_proof(b"smp-dos-npaths");
-        proof.n_paths += 1;
-        expect_malformed(&proof, &root, b"smp-dos-npaths", "n_paths+1");
+    fn dos_gate_pair_phys_out_of_range_rejected() {
+        let (mut proof, root) = dos_proof(b"smp-dos-pairphys");
+        proof.pair_phys[0] = proof.merkle_roots.len();
+        expect_malformed(&proof, &root, b"smp-dos-pairphys", "pair_phys out of range");
+    }
+
+    /// E1 mixed-root surface: pointing a pair at a DIFFERENT physical node's
+    /// entry swaps the padded root its shift is checked against — the shift
+    /// replay of its committed chain can no longer reach that root.
+    #[test]
+    fn forged_pair_phys_swap_rejected() {
+        let (path, _entry) = honest_path_with_entry();
+        let (mut proof, root) = prove_and_root(&[path]);
+        assert_eq!(proof.merkle_roots.len(), 2, "two physical nodes");
+        proof.pair_phys.swap(0, 1);
+        let mut chv = FsChallenger::new(b"smp-entries");
+        let res = verify_sound_multiproof(&proof, &root, &mut chv);
+        assert!(
+            res.is_err(),
+            "pair→phys table permutation must be rejected, got Ok"
+        );
+    }
+
+    /// E1 positive: two paths traversing the SAME physical node toward
+    /// different children share one physical entry (n_phys < u) and verify.
+    #[test]
+    fn shared_physical_node_two_selections_accepts() {
+        let node0 = MhotNodeWitness {
+            children: vec![[0x11; 32], [0x22; 32]],
+            selected_child: 0,
+        };
+        let node1 = MhotNodeWitness {
+            children: vec![[0x11; 32], [0x22; 32]],
+            selected_child: 1,
+        };
+        let i0 = MhotMembershipInput::from_node(node0);
+        let i1 = MhotMembershipInput::from_node(node1);
+        let root = node_root(&i0);
+        let mut ch = FsChallenger::new(b"smp-shared-phys");
+        let proof = prove_sound_multiproof(&[vec![i0], vec![i1]], &mut ch);
+        assert_eq!(proof.merkle_shifts.len(), 2, "two pairs");
+        assert_eq!(proof.merkle_roots.len(), 1, "one shared physical node");
+        assert_eq!(proof.pair_phys, vec![0, 0]);
+        let mut chv = FsChallenger::new(b"smp-shared-phys");
+        verify_sound_multiproof(&proof, &root, &mut chv)
+            .expect("two selections of one physical node must verify");
     }
 
     /// M1 acceptance gate: proof bytes must be INDEPENDENT of scratch-pool

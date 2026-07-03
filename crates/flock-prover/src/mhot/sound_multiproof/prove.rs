@@ -19,13 +19,17 @@ pub(crate) fn bytes_to_words(b: &[u8; 32]) -> [u32; 8] {
     w
 }
 
-fn node_identity(input: &MhotMembershipInput) -> Vec<u8> {
+/// Identity of the PHYSICAL node: children + content metadata, WITHOUT the
+/// selected child. Two queries that traverse the same tree node but diverge
+/// to different children share one physical identity (and hence one wire
+/// copy of the tree-determined data: content_meta, native/padded root,
+/// block count) while keeping distinct per-pair data (leaf, b_bits, shift).
+fn phys_identity(input: &MhotMembershipInput) -> Vec<u8> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&(input.node.children.len() as u32).to_le_bytes());
     for child in &input.node.children {
         bytes.extend_from_slice(child);
     }
-    bytes.extend_from_slice(&(input.node.selected_child as u32).to_le_bytes());
     for &mask in &input.content.extraction_masks {
         bytes.extend_from_slice(&mask.to_le_bytes());
     }
@@ -37,6 +41,14 @@ fn node_identity(input: &MhotMembershipInput) -> Vec<u8> {
     for &count in &input.content.child_leaf_counts {
         bytes.extend_from_slice(&count.to_le_bytes());
     }
+    bytes
+}
+
+/// Identity of a (physical node, selected child) PAIR — the unit the shift
+/// proofs, leaves, b_bits and route witnesses are keyed by.
+fn pair_identity(input: &MhotMembershipInput) -> Vec<u8> {
+    let mut bytes = phys_identity(input);
+    bytes.extend_from_slice(&(input.node.selected_child as u32).to_le_bytes());
     bytes
 }
 
@@ -56,7 +68,7 @@ use flock_core::pcs::{
 };
 
 use crate::mhot::merkle_membership::{
-    MhotMembershipInput, SOF_PACKED_BASE, pad_to_needed, pd_point, route_sof_f128,
+    ContentMeta, MhotMembershipInput, SOF_PACKED_BASE, pad_to_needed, pd_point, route_sof_f128,
 };
 use crate::mhot::multiproof::{fork_pcs_challenger, open_core_ligerito};
 use crate::mhot::native_witness::mhot_node_to_sha256_merkle;
@@ -113,29 +125,41 @@ pub fn prove_sound_multiproof(
         assert!(!path.is_empty(), "each path must have at least one node");
     }
 
-    // -- Dedup --
-    let mut identity_map: HashMap<Vec<u8>, usize> = HashMap::new();
+    // -- Two-level dedup: pairs (node, selected-child) and physical nodes --
+    let mut pair_map: HashMap<Vec<u8>, usize> = HashMap::new();
+    let mut phys_map: HashMap<Vec<u8>, usize> = HashMap::new();
     let mut unique_nodes: Vec<MhotMembershipInput> = Vec::new();
+    let mut pair_phys: Vec<usize> = Vec::new();
+    let mut n_phys = 0usize;
     let mut node_indices_per_path: Vec<Vec<usize>> = Vec::with_capacity(paths.len());
     let mut path_depths: Vec<usize> = Vec::with_capacity(paths.len());
 
     for path in paths {
         let mut indices = Vec::with_capacity(path.len());
         for input in path {
-            let key = node_identity(input);
-            let idx = identity_map.entry(key).or_insert_with(|| {
+            let key = pair_identity(input);
+            let idx = *pair_map.entry(key).or_insert_with(|| {
+                let p = *phys_map.entry(phys_identity(input)).or_insert_with(|| {
+                    let p = n_phys;
+                    n_phys += 1;
+                    p
+                });
                 let i = unique_nodes.len();
                 unique_nodes.push(input.clone());
+                pair_phys.push(p);
                 i
             });
-            indices.push(*idx);
+            indices.push(idx);
         }
         path_depths.push(path.len());
         node_indices_per_path.push(indices);
     }
 
     let u = unique_nodes.len();
-    eprintln!("[mem] after dedup ({} unique): {:.0} MB", u, vmrss_mb());
+    eprintln!(
+        "[mem] after dedup ({} pairs, {} physical): {:.0} MB",
+        u, n_phys, vmrss_mb()
+    );
 
     // -- Per-node: compute in-node merkle compressions and block counts --
     // native_order=true: the chain IS the true in-node tree path, so the shift
@@ -254,6 +278,28 @@ pub fn prove_sound_multiproof(
     );
     eprintln!("[mem] after route proof: {:.0} MB", vmrss_mb());
 
+    // -- Collect the tree-determined (physical) fields once per physical
+    //    node. The padded root, native root, block count and content meta
+    //    depend only on the node's children/content, never on the selected
+    //    child; pairs sharing a physical node MUST agree on them.
+    let mut phys_roots: Vec<[u32; 8]> = vec![[0; 8]; n_phys];
+    let mut phys_native_roots: Vec<[u32; 8]> = vec![[0; 8]; n_phys];
+    let mut phys_block_counts: Vec<usize> = vec![0; n_phys];
+    let mut phys_metas: Vec<Option<ContentMeta>> = vec![None; n_phys];
+    for i in 0..u {
+        let p = pair_phys[i];
+        if phys_metas[p].is_none() {
+            phys_roots[p] = merkle_data[i].3;
+            phys_native_roots[p] = merkle_data[i].4;
+            phys_block_counts[p] = merkle_block_counts[i];
+            phys_metas[p] = Some(unique_nodes[i].content.clone());
+        } else {
+            debug_assert_eq!(phys_roots[p], merkle_data[i].3);
+            debug_assert_eq!(phys_native_roots[p], merkle_data[i].4);
+            debug_assert_eq!(phys_block_counts[p], merkle_block_counts[i]);
+        }
+    }
+
     SoundMultiproof {
         merkle_zc: merkle_open.zc_proof,
         merkle_lc: merkle_open.lc_proof,
@@ -262,13 +308,14 @@ pub fn prove_sound_multiproof(
 
         merkle_shifts,
         merkle_leaves: (0..u).map(|i| merkle_data[i].2).collect(),
-        merkle_roots: (0..u).map(|i| merkle_data[i].3).collect(),
+        merkle_roots: phys_roots,
         merkle_b_bits: (0..u).map(|i| merkle_data[i].1.clone()).collect(),
-        merkle_native_roots: (0..u).map(|i| merkle_data[i].4).collect(),
-        content_metas: (0..u).map(|i| unique_nodes[i].content.clone()).collect(),
+        merkle_native_roots: phys_native_roots,
+        content_metas: phys_metas.into_iter().map(|m| m.expect("every phys referenced")).collect(),
+        pair_phys,
 
         merkle_block_offsets: merkle_alloc.offsets,
-        merkle_block_counts,
+        merkle_block_counts: phys_block_counts,
         n_log_merkle: merkle_alloc.n_log,
 
         route_zc: route_open.zc_proof,
@@ -277,7 +324,6 @@ pub fn prove_sound_multiproof(
         route_commitment: route_open.commitment,
         n_routes,
 
-        n_paths: paths.len(),
         path_depths,
         path_mapping: PathMapping { node_indices: node_indices_per_path },
     }

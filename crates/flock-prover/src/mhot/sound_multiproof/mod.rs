@@ -34,23 +34,31 @@ pub struct SoundMultiproof {
     pub merkle_pcs: BatchOpeningProofLigerito,
     pub merkle_commitment: Commitment,
 
-    // Per-node merkle shift proofs
+    // Per-PAIR data (u = number of unique (node, selected-child) pairs):
+    // the shift authenticates the selected leaf's chain, so leaf, side bits,
+    // shift proof and the chain's block offset are keyed by pair.
     pub merkle_shifts: Vec<MerklePathShiftProof>,
     pub merkle_leaves: Vec<[u32; 8]>,
-    pub merkle_roots: Vec<[u32; 8]>,
     pub merkle_b_bits: Vec<Vec<bool>>,
-    // Per-node real (pre-padding) in-node tree root. merkle_roots[i] is the
-    // PADDED chain root the shift authenticates (chains are padded to the
-    // block count); the verifier pad-forwards this value n_pad times, asserts
-    // it reaches merkle_roots[i] (which authenticates it), then computes
-    // content_hash natively over it — binding the committed tree to the
-    // parent leaf / public root (no siblings, no chain SNARK needed).
+    pub merkle_block_offsets: Vec<usize>,
+    /// pair → physical-node index into the per-physical vectors below. Two
+    /// queries traversing the same tree node toward different children share
+    /// one physical entry (tree-determined data) but keep distinct pair data.
+    pub pair_phys: Vec<usize>,
+
+    // Per-PHYSICAL-node data (tree-determined, independent of the selected
+    // child; deduplicating these is the E1 wire shrink).
+    /// The PADDED chain root the shift authenticates. Physical: padding
+    /// continues from the native root, so it is a function of the tree alone.
+    pub merkle_roots: Vec<[u32; 8]>,
+    /// Real (pre-padding) in-node tree root. The verifier pad-forwards this
+    /// n_pad times, asserts it reaches merkle_roots[p] (which the shifts
+    /// authenticate), then computes content_hash natively over it — binding
+    /// the committed tree to the parent leaf / public root.
     pub merkle_native_roots: Vec<[u32; 8]>,
     pub content_metas: Vec<ContentMeta>,
-
-    // Block layout metadata (verifier needs these for PD claim assembly)
-    pub merkle_block_offsets: Vec<usize>,
     pub merkle_block_counts: Vec<usize>,
+
     pub n_log_merkle: usize,
 
     // Route base (unchanged)
@@ -60,7 +68,6 @@ pub struct SoundMultiproof {
     pub route_commitment: Commitment,
     pub n_routes: usize,
 
-    pub n_paths: usize,
     pub path_depths: Vec<usize>,
     pub path_mapping: PathMapping,
 }
@@ -116,10 +123,10 @@ fn authenticated_side(proof: &SoundMultiproof, i: usize, d: usize) -> bool {
     proof.merkle_b_bits[i].get(d).copied().unwrap_or(false)
 }
 
-/// The authenticated selected-child index of node `i`, reconstructed from its
+/// The authenticated selected-child index of pair `i`, reconstructed from its
 /// side bits (the same bits the shift consumed as the tree order).
 fn selected_index(proof: &SoundMultiproof, i: usize) -> usize {
-    let depth = innode_depth(&proof.content_metas[i]);
+    let depth = innode_depth(&proof.content_metas[proof.pair_phys[i]]);
     (0..depth).fold(0usize, |acc, d| {
         acc | ((authenticated_side(proof, i, d) as usize) << d)
     })
@@ -139,17 +146,20 @@ pub fn verify_sound_multiproof(
     challenger: &mut FsChallenger,
 ) -> Result<(), MhotMembershipError> {
     let u = proof.merkle_shifts.len();
-    // Every per-node Vec is indexed at [0..u) below; a malformed proof with a
-    // short Vec must be rejected cleanly, not panic (verifier DoS hardening —
-    // load-bearing once SoundMultiproof gains a Deserialize path).
+    let n_phys = proof.merkle_roots.len();
+    // Every per-pair Vec is indexed at [0..u) and every per-physical Vec at
+    // [0..n_phys) below; a malformed proof with a short Vec must be rejected
+    // cleanly, not panic (verifier DoS hardening — load-bearing once
+    // SoundMultiproof gains a Deserialize path).
     if u == 0
-        || u != proof.merkle_native_roots.len()
-        || u != proof.content_metas.len()
         || u != proof.merkle_b_bits.len()
-        || u != proof.merkle_block_counts.len()
         || u != proof.merkle_leaves.len()
-        || u != proof.merkle_roots.len()
         || u != proof.merkle_block_offsets.len()
+        || u != proof.pair_phys.len()
+        || n_phys == 0
+        || n_phys != proof.merkle_native_roots.len()
+        || n_phys != proof.content_metas.len()
+        || n_phys != proof.merkle_block_counts.len()
     {
         return Err(MhotMembershipError::RootMismatch {
             expected: *expected_root,
@@ -167,16 +177,11 @@ pub fn verify_sound_multiproof(
     }
     if proof.n_routes != u {
         return Err(MhotMembershipError::MalformedProof {
-            reason: "n_routes != unique node count",
+            reason: "n_routes != unique pair count",
         });
     }
-    if proof.n_paths != proof.path_mapping.node_indices.len() {
-        return Err(MhotMembershipError::MalformedProof {
-            reason: "n_paths != path_mapping length",
-        });
-    }
-    for i in 0..u {
-        let meta = &proof.content_metas[i];
+    for p in 0..n_phys {
+        let meta = &proof.content_metas[p];
         let mask_bits: u32 = meta.extraction_masks.iter().map(|m| m.count_ones()).sum();
         let fanout = meta.sparse_partial_keys.len();
         // fanout ∈ [2, 32]: internal nodes always have ≥2 children (the prover
@@ -187,13 +192,22 @@ pub fn verify_sound_multiproof(
             || fanout != meta.child_leaf_counts.len()
             || fanout < 2
             || fanout > 32
-            || innode_depth(meta) > proof.merkle_block_counts[i]
-            || !proof.merkle_block_counts[i].is_power_of_two()
-            || proof.merkle_block_counts[i] > MAX_MERKLE_BLOCKS
+            || innode_depth(meta) > proof.merkle_block_counts[p]
+            || !proof.merkle_block_counts[p].is_power_of_two()
+            || proof.merkle_block_counts[p] > MAX_MERKLE_BLOCKS
         {
             return Err(MhotMembershipError::RootMismatch {
                 expected: *expected_root,
                 actual: [0; 8],
+            });
+        }
+    }
+    for i in 0..u {
+        // Every pair must reference a valid physical node BEFORE any indexed
+        // use of pair_phys[i] below.
+        if proof.pair_phys[i] >= n_phys {
+            return Err(MhotMembershipError::MalformedProof {
+                reason: "pair_phys index out of range",
             });
         }
         // Offsets are prover-chosen; unaligned or out-of-range values would
@@ -202,7 +216,7 @@ pub fn verify_sound_multiproof(
         // allocate_blocks_aligned: aligned to their own (power-of-two) count
         // and contained in the committed range.
         let off = proof.merkle_block_offsets[i];
-        let cnt = proof.merkle_block_counts[i];
+        let cnt = proof.merkle_block_counts[proof.pair_phys[i]];
         if off % cnt != 0
             || off
                 .checked_add(cnt)
@@ -219,7 +233,7 @@ pub fn verify_sound_multiproof(
     // two. This pins the setup allocation size to the wire's real span.
     {
         let max_end = (0..u)
-            .map(|i| proof.merkle_block_offsets[i] + proof.merkle_block_counts[i])
+            .map(|i| proof.merkle_block_offsets[i] + proof.merkle_block_counts[proof.pair_phys[i]])
             .max()
             .expect("u > 0 gated above");
         let min_n = 1usize << (22 - crate::r1cs_hashes::sha2::K_LOG);
@@ -250,11 +264,12 @@ pub fn verify_sound_multiproof(
     let mut merkle_pd_refs_data: Vec<(Vec<F128>, F128)> = Vec::with_capacity(u);
 
     for i in 0..u {
-        let n_inst = proof.merkle_block_counts[i];
+        let n_inst = proof.merkle_block_counts[proof.pair_phys[i]];
         let inst_log = n_inst.trailing_zeros() as usize;
         let leaf_phys = crate::r1cs_hashes::sha2::hash_to_phys_bits(&proof.merkle_leaves[i]);
         let leaf_r = merkle_fold.fold_public_phys(&leaf_phys);
-        let root_phys = crate::r1cs_hashes::sha2::hash_to_phys_bits(&proof.merkle_roots[i]);
+        let root_phys =
+            crate::r1cs_hashes::sha2::hash_to_phys_bits(&proof.merkle_roots[proof.pair_phys[i]]);
         let root_r = merkle_fold.fold_public_phys(&root_phys);
 
         let mut b_bits_padded = proof.merkle_b_bits[i].clone();
@@ -269,7 +284,7 @@ pub fn verify_sound_multiproof(
 
         let point = build_merkle_claim_point_at_offset(
             &MERKLE_LAYOUT, &merkle_fold, &claims,
-            proof.merkle_block_offsets[i], proof.merkle_block_counts[i],
+            proof.merkle_block_offsets[i], n_inst,
             proof.n_log_merkle,
         );
         merkle_pd_refs_data.push((point, claims.value));
@@ -287,31 +302,34 @@ pub fn verify_sound_multiproof(
         &merkle_ab, &merkle_c, &merkle_pd_refs, &mut merkle_pcs_ch,
     ).map_err(MhotMembershipError::NodeVerify2)?;
 
-    // -- Node identity: authenticate each node's real (pre-padding) tree root
-    //    via the pad-forward check — padding merkle_native_roots[i] forward
-    //    n_pad times (mirroring pad_to_needed byte-for-byte: current in X_L,
-    //    zero sibling, SHA256_IV) must reach the shift-authenticated padded
-    //    root merkle_roots[i]. The depth (hence n_pad) derives from the
+    // -- Node identity: authenticate each PHYSICAL node's real (pre-padding)
+    //    tree root via the pad-forward check — padding merkle_native_roots[p]
+    //    forward n_pad times (mirroring pad_to_needed byte-for-byte: current
+    //    in X_L, zero sibling, SHA256_IV) must reach the shift-authenticated
+    //    padded root merkle_roots[p]. The depth (hence n_pad) derives from the
     //    authenticated fanout, so a chain of the wrong tree depth cannot pass.
     //    content_hash is then COMPUTED natively over the authenticated
     //    native_root; committing a fake in-node tree or tampering
     //    content_metas changes it and breaks the binding below (cross-node
-    //    parent-leaf / public root). --
-    let mut content_hashes: Vec<[u32; 8]> = Vec::with_capacity(u);
-    for i in 0..u {
-        let n_pad = proof.merkle_block_counts[i] - innode_depth(&proof.content_metas[i]);
-        let mut padded = proof.merkle_native_roots[i];
+    //    parent-leaf / public root). Runs once per physical node — pairs
+    //    sharing a node share ONE root and ONE content_hash by construction,
+    //    which is what makes the mixed-root forgery (two pairs of one node
+    //    carrying different roots) structurally impossible. --
+    let mut content_hashes: Vec<[u32; 8]> = Vec::with_capacity(n_phys);
+    for p in 0..n_phys {
+        let n_pad = proof.merkle_block_counts[p] - innode_depth(&proof.content_metas[p]);
+        let mut padded = proof.merkle_native_roots[p];
         for _ in 0..n_pad {
             let mut m = [0u32; 16];
             m[..8].copy_from_slice(&padded);
             padded = sha256_compress(&SHA256_IV, &m);
         }
-        if padded != proof.merkle_roots[i] {
-            return Err(MhotMembershipError::NativeRootMismatch { node_idx: i });
+        if padded != proof.merkle_roots[p] {
+            return Err(MhotMembershipError::NativeRootMismatch { node_idx: p });
         }
         let ch = compute_content_hash(
-            &proof.content_metas[i],
-            &leaf_words_to_digest_bytes(&proof.merkle_native_roots[i]),
+            &proof.content_metas[p],
+            &leaf_words_to_digest_bytes(&proof.merkle_native_roots[p]),
         );
         content_hashes.push(bytes_to_words(&ch));
     }
@@ -333,7 +351,7 @@ pub fn verify_sound_multiproof(
                 });
             }
             let parent_leaf = proof.merkle_leaves[parent_u];
-            let child_content = content_hashes[child_u];
+            let child_content = content_hashes[proof.pair_phys[child_u]];
             if parent_leaf != child_content {
                 return Err(MhotMembershipError::CrossNodeBinding {
                     parent_idx: parent_u,
@@ -357,10 +375,10 @@ pub fn verify_sound_multiproof(
                 expected: *expected_root, actual: [0; 8],
             });
         }
-        if content_hashes[root_u] != *expected_root {
+        if content_hashes[proof.pair_phys[root_u]] != *expected_root {
             return Err(MhotMembershipError::RootMismatch {
                 expected: *expected_root,
-                actual: content_hashes[root_u],
+                actual: content_hashes[proof.pair_phys[root_u]],
             });
         }
     }
@@ -456,7 +474,7 @@ pub fn verify_sound_multiproof_with_entries(
         .enumerate()
     {
         for (level, &u_i) in indices.iter().enumerate() {
-            let meta = &proof.content_metas[u_i];
+            let meta = &proof.content_metas[proof.pair_phys[u_i]];
             let dense = compute_dense_key(&entry.key, &meta.extraction_masks);
             let matched = search_in_sparse_keys(dense, &meta.sparse_partial_keys);
             if matched != selected[u_i] {
@@ -476,7 +494,11 @@ pub fn verify_sound_multiproof_with_entries(
         // can byte-collide with an internal node's content_hash. A leaf subtree
         // has exactly one leaf; internal children have ≥2. `.get()` also guards
         // the degenerate empty-fanout node (selected has no counts entry).
-        if proof.content_metas[last_u].child_leaf_counts.get(selected[last_u]) != Some(&1) {
+        if proof.content_metas[proof.pair_phys[last_u]]
+            .child_leaf_counts
+            .get(selected[last_u])
+            != Some(&1)
+        {
             return Err(MhotMembershipError::EntryLeafMismatch { path_idx: p });
         }
         let expected_leaf = bytes_to_words(&leaf_content_hash(entry));

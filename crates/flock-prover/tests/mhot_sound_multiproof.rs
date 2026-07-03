@@ -87,7 +87,7 @@ fn sound_multiproof_1_path() {
     let paths = vec![path];
     let mut ch = FsChallenger::new(b"smp-1path");
     let proof = prove_sound_multiproof(&paths, &mut ch);
-    assert_eq!(proof.n_paths, 1);
+    assert_eq!(proof.path_mapping.node_indices.len(), 1);
     assert_eq!(proof.merkle_shifts.len(), 3);
     let root = root_of(&paths[0][0]);
     let mut chv = FsChallenger::new(b"smp-1path");
@@ -108,7 +108,7 @@ fn sound_multiproof_4_paths_shared() {
     let paths = vec![path.clone(), path.clone(), path.clone(), path.clone()];
     let mut ch = FsChallenger::new(b"smp-4shared");
     let proof = prove_sound_multiproof(&paths, &mut ch);
-    assert_eq!(proof.n_paths, 4);
+    assert_eq!(proof.path_mapping.node_indices.len(), 4);
     assert_eq!(
         proof.merkle_shifts.len(), 3,
         "4 identical paths should dedup to 3 unique nodes"
