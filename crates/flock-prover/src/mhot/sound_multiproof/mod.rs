@@ -180,6 +180,17 @@ pub fn verify_sound_multiproof(
             reason: "n_routes != unique pair count",
         });
     }
+    // n_phys ≤ u by construction (every physical node is created inside pair
+    // creation, prove.rs). Without this bound, junk physical nodes never
+    // referenced by any pair still cost the verifier a per-phys gate + a
+    // pad-forward loop (≤64 SHA-256 each) apiece — O(n_phys) work decoupled
+    // from u. Latent while Serialize-only; the amplification is cheap (arrays,
+    // not proof objects) once a Deserialize path exists.
+    if n_phys > u {
+        return Err(MhotMembershipError::MalformedProof {
+            reason: "n_phys exceeds pair count",
+        });
+    }
     for p in 0..n_phys {
         let meta = &proof.content_metas[p];
         let mask_bits: u32 = meta.extraction_masks.iter().map(|m| m.count_ones()).sum();

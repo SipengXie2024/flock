@@ -486,6 +486,24 @@
         expect_malformed(&proof, &root, b"smp-dos-pairphys", "pair_phys out of range");
     }
 
+    /// n_phys > u lets junk physical nodes (never referenced by any pair) each
+    /// cost the verifier a per-phys gate + a pad-forward loop, decoupled from
+    /// u. Honest n_phys ≤ u; padding the per-phys vectors past u must reject.
+    #[test]
+    fn dos_gate_n_phys_inflated_rejected() {
+        let (mut proof, root) = dos_proof(b"smp-dos-nphys");
+        // Append junk physical entries (all four per-phys vectors must stay
+        // length-consistent so the earlier length gate doesn't fire first).
+        let junk_meta = proof.content_metas[0].clone();
+        for _ in 0..4 {
+            proof.merkle_roots.push([0; 8]);
+            proof.merkle_native_roots.push([0; 8]);
+            proof.content_metas.push(junk_meta.clone());
+            proof.merkle_block_counts.push(proof.merkle_block_counts[0]);
+        }
+        expect_malformed(&proof, &root, b"smp-dos-nphys", "n_phys > u");
+    }
+
     /// E1 mixed-root surface: pointing a pair at a DIFFERENT physical node's
     /// entry swaps the padded root its shift is checked against — the shift
     /// replay of its committed chain can no longer reach that root.
